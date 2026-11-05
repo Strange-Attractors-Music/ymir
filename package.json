@@ -5,6 +5,8 @@
   "type": "module",
   "scripts": {
     "browse": "node tools/serve.mjs",
+    "launch": "./launch.sh",
+    "tray": "python3 tools/tray.py",
     "test": "node --test test/*.test.mjs",
     "build:pages": "vite build && node tools/copy-pages-assets.mjs"
   },

@@ -4,7 +4,7 @@ Ymir is a reusable browser application for cataloging and previewing Models,
 Props, Materials, and named Colors. Its local editor writes catalog metadata.
 Trinity supplies the built WebGL renderer; Ymir does not depend on Synesthesia.
 
-The public repository and [GitHub Pages demo](https://realrandolph.github.io/ymir/)
+The public repository and [GitHub Pages demo](https://strange-attractors-music.github.io/ymir/)
 contain the application, renderer resources, all 26 Materials, and five distinct Props:
 Faceted Accent Crystal, Curved Gold Hinged Barrette, Nail Polish Applicator,
 Ribboned Gift Case, and Velvet-Lined Accessory Tray. The barrette offers Gold,

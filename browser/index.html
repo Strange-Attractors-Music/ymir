@@ -24,7 +24,7 @@ header {
   background: #161b22;
   border-bottom: 1px solid #30363d;
   min-width: 0;
-  z-index: 20;
+  z-index: 40;
 }
 header h1 { margin: 0; font-size: 18px; font-weight: 700; color: #58a6ff; letter-spacing: -0.02em; }
 header p { margin: 0; flex: 1; font-size: 12px; color: #8b949e; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -61,7 +61,7 @@ aside {
   border-right: 1px solid #262c36;
   gap: 8px;
   overflow: hidden;
-  z-index: 25;
+  z-index: 30;
 }
 aside input, aside select {
   font: inherit;
@@ -101,6 +101,16 @@ aside input:focus, aside select:focus {
   color: #f0f6fc;
 }
 .asset small { display: block; color: #8b949e; font-size: 11px; margin-top: 2px; }
+
+/* Backdrop overlay on mobile when sidebar is open */
+.drawer-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(2px);
+  -webkit-backdrop-filter: blur(2px);
+  z-index: 25;
+}
 
 /* Viewport Section: Full-bleed 3D canvas and overlaid HUD controls */
 #viewport-section {
@@ -548,10 +558,12 @@ dialog input:focus, dialog textarea:focus, dialog select:focus {
     box-shadow: 8px 0 32px rgba(0, 0, 0, 0.8);
     transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1);
     transform: translateX(0);
+    z-index: 30;
   }
   aside.drawer-closed {
     transform: translateX(-100%);
     pointer-events: none;
+    box-shadow: none;
   }
 
   .hud-top { top: 10px; left: 10px; right: 10px; }
@@ -572,6 +584,11 @@ dialog input:focus, dialog textarea:focus, dialog select:focus {
     padding: 10px 12px;
   }
 }
+@media (min-width: 769px) {
+  .mobile-nav-toggle { display: none !important; }
+  .drawer-backdrop { display: none !important; }
+  aside { transform: none !important; }
+}
 </style>
 </head>
 <body>
@@ -584,6 +601,9 @@ dialog input:focus, dialog textarea:focus, dialog select:focus {
   <button id="new-color" type="button">New Color</button>
 </header>
 <main>
+  <!-- Mobile drawer backdrop -->
+  <div id="drawer-backdrop" class="drawer-backdrop" hidden></div>
+
   <aside id="sidebar-drawer">
     <label for="search" class="sr-only">Search assets</label>
     <input id="search" placeholder="Search props, models…">

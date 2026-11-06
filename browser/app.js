@@ -8,7 +8,7 @@ const MIN_ZOOM = 0.55; // Prevent camera from entering inside model geometry
 const MAX_ZOOM = 3.5;
 
 let renderer,world,transforms,previewTransition=null;
-let turn=0,tilt=0,zoom=1,generation=0,dirty=false,drag=null;
+let turn=0,tilt=0,zoom=1,generation=0,dirty=false;
 let currentEntry,currentVariant,editState,editTargetState,deleteState;
 let surfaceState,selectedSlot=null,selectedPart=null,pickMeshes=[],lastCamera;
 let turntableOn=false;
@@ -74,6 +74,7 @@ async function select(entry,{variant=entry.defaultVariant,previewMaterial,previe
     if(['material','color'].includes(entry.type)&&(!material||!color))throw new Error('Pairing previews need an existing Material and named Color. Define a Color palette resource first if none exists.');
     const prop=entry.type==='prop'?await selectedLibrary.loadProp(entry.manifest,{variant}):entry.type==='model'?await selectedLibrary.loadModel(entry.manifest):swatch(material,color);
     if(token!==generation)return;
+
     renderer?.dispose();renderer=null;
     if(!preserveView){turn=0;tilt=0;zoom=1;}
     const isMaterialSwatch=['material','color'].includes(entry.type),previewNodes=prop.nodes.map(n=>({...n,assembly:0}));
@@ -95,6 +96,7 @@ async function select(entry,{variant=entry.defaultVariant,previewMaterial,previe
     if(token!==generation){candidate.dispose();return;}
     renderer=candidate;
     world.bounds=prop.asset.bounds;
+
     const transformFor=n=>{
       let matrix=model(n.pos,n.scale,n.rot);
       if(n.joint)matrix=multiply(model(n.joint.pivot,[1,1,1],[n.joint.rest_degrees,0,0]),matrix);
@@ -102,11 +104,31 @@ async function select(entry,{variant=entry.defaultVariant,previewMaterial,previe
     };
     transforms=world.nodes.map(transformFor);
     if(isMaterialSwatch)previewTransition={node:previewNodes[0],transform:transformFor(previewNodes[0]),world};
+
     pickMeshes=['prop','model'].includes(entry.type)?world.nodes.map((n,index)=>{
       const vertices=new Float32Array(prop.raw,n.vertex_offset,n.vertex_count*8),matrix=transforms[index].model;
       const points=[];for(let i=0;i<vertices.length;i+=8){const v=vertices.subarray(i,i+3);points.push([0,1,2].map(k=>matrix[k]*v[0]+matrix[k+4]*v[1]+matrix[k+8]*v[2]+matrix[k+12]));}
       return {node:n,points,indices:new Uint32Array(prop.raw,n.index_offset,n.index_count)};
     }):[];
+
+    // Provide immediate base surface model structure so part picking works instantly
+    surfaceState={
+      modelData:prop.asset,
+      slots:prop.asset?.slots??[],
+      groups:[],
+      variantSlots:[]
+    };
+    if(entry.type==='prop'){
+      configureSurface(prop.asset);
+    }
+
+    // DRAW IMMEDIATELY ON SELECTION - Zero lag, no waiting for async calls
+    dirty=true;
+    draw();
+    requestAnimationFrame(()=>{
+      dirty=true;
+      draw();
+    });
 
     const swatchControls=$('swatch-controls');
     if(swatchControls){
@@ -120,23 +142,22 @@ async function select(entry,{variant=entry.defaultVariant,previewMaterial,previe
       }
     }
 
-    if(['prop','model'].includes(entry.type)){
-      surfaceState=await api(`/api/asset?id=${encodeURIComponent(entry.id)}`);
-      if(token!==generation)return;
-      configureSurface(entry.type==='model'?prop.asset:surfaceState.model);
-    }
-
     for(const button of $('list').children){
       button.setAttribute('aria-pressed',button.dataset.id===entry.id||$('type').value==='prop'&&button.dataset.id===entry.modelId?'true':'false');
     }
 
-    // Immediately draw and schedule the frame to ensure instant render without needing rotation
-    dirty=true;
-    draw();
-    requestAnimationFrame(()=>{
-      dirty=true;
-      draw();
-    });
+    // Fetch full server-side metadata in background without blocking rendering or part selection
+    if(!readOnly&&['prop','model'].includes(entry.type)){
+      try{
+        const state=await api(`/api/asset?id=${encodeURIComponent(entry.id)}`);
+        if(token===generation){
+          surfaceState=state;
+          configureSurface(entry.type==='model'?prop.asset:(state.model||prop.asset));
+        }
+      }catch(err){
+        // Non-fatal: local rendering remains functional
+      }
+    }
   }catch(e){
     if(token===generation)$('error').textContent=e.stack??e.message;
   }
@@ -155,9 +176,10 @@ function fillColorResources(select,material,id){
 }
 
 function configureSurface(model){
+  if(!model)return;
   surfaceState.modelData=model;
   const overrides=surfaceState.variantSlots?.find(v=>v.id===currentVariant)?.slots??[];
-  surfaceState.groups=currentEntry.type==='prop'?groupSurfaceAssignments(library.catalog,model,surfaceState.slots,overrides):[];
+  surfaceState.groups=currentEntry?.type==='prop'?groupSurfaceAssignments(library.catalog,model,surfaceState.slots??[],overrides):[];
 }
 
 function selectedGroup(){
@@ -192,13 +214,14 @@ function highlightSelected(){
 }
 
 function onPartSelected(slotId,partId){
-  if(readOnly||currentEntry?.type!=='prop')return;
+  if(readOnly||!['prop','model'].includes(currentEntry?.type))return;
   selectedSlot=slotId;
   selectedPart=partId;
   highlightSelected();
 
-  const slot=surfaceState?.modelData?.slots?.find(s=>s.id===slotId);
-  const part=surfaceState?.modelData?.parts?.find(p=>p.id===partId);
+  const modelData=surfaceState?.modelData||currentEntry;
+  const slot=modelData?.slots?.find(s=>s.id===slotId);
+  const part=modelData?.parts?.find(p=>p.id===partId);
   const group=selectedGroup();
 
   const title=slot?slot.name:(part?.name||'Selected Part');
@@ -213,7 +236,7 @@ function onPartSelected(slotId,partId){
   const currentColorId=assigned?.color?.id!==undefined?assigned.color.id:(group?.usesDefaultColor?'':(group?.colorId??''));
   fillColorResources($('slot-color'),mat,currentColorId);
 
-  $('group-toggle').checked=true;
+  $('group-toggle').checked=Boolean(group&&group.slotIds?.length>1);
 }
 
 function applyStagedAssignment(){
@@ -501,13 +524,45 @@ function pickPart(e){
   }
 }
 
-// Mobile sidebar drawer handling
+// Mobile sidebar drawer collapse & toggle
 const sidebarDrawer=$('sidebar-drawer');
 const toggleSidebarBtn=$('toggle-sidebar');
-if(toggleSidebarBtn&&sidebarDrawer){
+const drawerBackdrop=$('drawer-backdrop');
+
+function collapseSidebar(){
+  if(sidebarDrawer){
+    sidebarDrawer.classList.add('drawer-closed');
+  }
+  if(drawerBackdrop){
+    drawerBackdrop.hidden=true;
+  }
+}
+
+function openSidebar(){
+  if(sidebarDrawer){
+    sidebarDrawer.classList.remove('drawer-closed');
+  }
+  if(drawerBackdrop&&window.innerWidth<=768){
+    drawerBackdrop.hidden=false;
+  }
+}
+
+if(toggleSidebarBtn){
   toggleSidebarBtn.onclick=()=>{
-    sidebarDrawer.classList.toggle('drawer-closed');
+    if(sidebarDrawer?.classList.contains('drawer-closed')){
+      openSidebar();
+    }else{
+      collapseSidebar();
+    }
   };
+}
+if(drawerBackdrop){
+  drawerBackdrop.onclick=collapseSidebar;
+}
+
+// On mobile, automatically collapse on initial load
+if(window.innerWidth<=768){
+  collapseSidebar();
 }
 
 function list(){
@@ -527,13 +582,13 @@ function list(){
     b.append(small);
     b.onclick=()=>{
       const targetEntry=type==='prop'?(members(entry).find(matches)??members(entry)[0]):entry;
-      if(targetEntry.id===currentEntry?.id)return;
+      if(targetEntry.id===currentEntry?.id){
+        collapseSidebar();
+        return;
+      }
       requestSwitch(()=>{
         select(targetEntry);
-        // On mobile, auto-close the drawer after selection so the user sees the model
-        if(window.innerWidth<=768&&sidebarDrawer){
-          sidebarDrawer.classList.add('drawer-closed');
-        }
+        collapseSidebar();
       });
     };
     $('list').append(b);
@@ -710,7 +765,7 @@ if(readOnly)for(const id of ['new-color','delete','edit'])$(id).hidden=true;
 
 list();
 
-// Touch & Pointer Gesture Controls (Supports Desktop Mouse & Full-Featured Mobile Touch)
+// Touch & Pointer Gesture Controls (Desktop Mouse & Mobile Touch)
 preview.style.touchAction='none';
 preview.style.cursor='grab';
 
@@ -719,6 +774,9 @@ let pinchStartDist=0;
 let pinchStartZoom=1;
 
 preview.onpointerdown=e=>{
+  // On mobile or anytime canvas is touched, auto-collapse sidebar drawer immediately
+  collapseSidebar();
+
   if(e.pointerType==='mouse'&&e.button!==0&&e.button!==1)return;
   e.preventDefault();
   preview.setPointerCapture(e.pointerId);
@@ -740,6 +798,13 @@ preview.onpointerdown=e=>{
   }
 };
 
+// Also collapse sidebar if user taps anywhere in the viewport area
+$('viewport-section').addEventListener('pointerdown',e=>{
+  if(!e.target.closest('#sidebar-drawer')&&!e.target.closest('#toggle-sidebar')){
+    collapseSidebar();
+  }
+});
+
 preview.onpointermove=e=>{
   if(!activePointers.has(e.pointerId))return;
   const p=activePointers.get(e.pointerId);
@@ -747,25 +812,22 @@ preview.onpointermove=e=>{
   const dy=e.clientY-p.y;
   p.x=e.clientX;
   p.y=e.clientY;
-  if(Math.hypot(e.clientX-p.startX,e.clientY-p.startY)>8){
+  if(Math.hypot(e.clientX-p.startX,e.clientY-p.startY)>6){
     p.moved=true;
   }
 
   if(activePointers.size===1){
-    // Single-finger touch or mouse drag:
-    // On touch: always use two-axis orbit (whichever direction chosen: down=CCW on X, up=CW on X, right=CCW on Y, left=CW on Y)
-    // On mouse: left-button (0) is horizontal only; middle-button (1) is two-axis.
-    const isTouch=p.pointerType==='touch'||p.pointerType==='pen';
-    const useTwoAxis=isTouch||p.button===1;
-    ({turn,tilt}=applyOrbitDrag(turn,tilt,useTwoAxis?1:0,dx,dy));
+    // Both desktop left-click/middle-click drag AND mobile touch drag perform two-axis orbit:
+    // down=CCW on X, up=CW on X; right=CCW on Y, left=CW on Y
+    ({turn,tilt}=applyOrbitDrag(turn,tilt,1,dx,dy));
     dirty=true;
   }else if(activePointers.size===2){
-    // Two-finger gesture: pinch to zoom out, spread to zoom in
+    // Two-finger pinch to zoom out, spread to zoom in
     const [p1,p2]=Array.from(activePointers.values());
     const currentDist=Math.hypot(p1.x-p2.x,p1.y-p2.y);
     if(pinchStartDist>0&&currentDist>0){
-      // Spreading fingers apart (currentDist > pinchStartDist): ratio < 1 -> zoom distance decreases -> ZOOMS IN!
-      // Pinching fingers together (currentDist < pinchStartDist): ratio > 1 -> zoom distance increases -> ZOOMS OUT!
+      // Spreading fingers apart: currentDist > pinchStartDist -> ratio < 1 -> zoom distance decreases -> ZOOMS IN!
+      // Pinching fingers together: currentDist < pinchStartDist -> ratio > 1 -> zoom distance increases -> ZOOMS OUT!
       const ratio=pinchStartDist/currentDist;
       zoom=Math.max(MIN_ZOOM,Math.min(MAX_ZOOM,pinchStartZoom*ratio));
       dirty=true;
@@ -777,7 +839,7 @@ function endPointer(e){
   if(!activePointers.has(e.pointerId))return;
   const p=activePointers.get(e.pointerId);
   const wasSingle=activePointers.size===1;
-  const isClick=wasSingle&&!p.moved&&Math.hypot(e.clientX-p.startX,e.clientY-p.startY)<8;
+  const isClick=wasSingle&&!p.moved&&Math.hypot(e.clientX-p.startX,e.clientY-p.startY)<6;
 
   activePointers.delete(e.pointerId);
   if(preview.hasPointerCapture(e.pointerId)){
@@ -806,8 +868,10 @@ preview.onlostpointercapture=()=>{
   preview.style.cursor='grab';
   pinchStartDist=0;
 };
+
 preview.addEventListener('auxclick',e=>{if(e.button===1)e.preventDefault();});
 preview.addEventListener('wheel',e=>{
+  collapseSidebar();
   if(!renderer)return;
   e.preventDefault();
   const pixels=e.deltaY*(e.deltaMode===1?16:e.deltaMode===2?preview.clientHeight:1);

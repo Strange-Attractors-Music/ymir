@@ -38,8 +38,9 @@ out vec4 frag;
 float hash(vec3 p){return fract(sin(dot(p,vec3(127.1,311.7,74.7)))*43758.5453);}
 vec3 room(vec3 r){
     vec3 c=mix(background*.16,vec3(.065,.054,.040),smoothstep(-.15,.8,r.y));
-    float vertical=(1.0-smoothstep(.13,.25,abs(r.x+.20)))*(1.0-smoothstep(.85,.95,abs(r.y-.12)));
-    float edge=(1.0-smoothstep(.025,.065,abs(r.x-.63)))*(1.0-smoothstep(.67,.8,abs(r.y-.15)));
+    // Diffused studio softboxes with natural Gaussian penumbra, avoiding harsh rectangular box boundaries
+    float vertical=exp(-((r.x+.20)*(r.x+.20)+(r.y-.12)*(r.y-.12)*.08)*18.0);
+    float edge=exp(-((r.x-.63)*(r.x-.63)*4.5+(r.y-.15)*(r.y-.15)*.12)*16.0);
     float top=pow(max(0.0,dot(r,normalize(vec3(-.3,.86,.30)))),24.0);
     c+=vec3(2.4,2.2,1.8)*vertical;
     c+=vec3(1.6,1.75,1.95)*edge;

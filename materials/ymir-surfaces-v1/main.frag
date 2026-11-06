@@ -131,8 +131,8 @@ vec3 sceneEnvironment(vec3 direction,float rough){
     // Prevent self-reflection artifacts on downward-facing surfaces where the probe (positioned
     // above the stage at Y=0.55 looking down) captured the top of the object. Downward reflections
     // smoothly transition to the analytic studio floor lighting instead of mirroring the top.
-    float floorFactor=smoothstep(0.05,-0.15,direction.y);
-    vec3 floorColor=roughRoom(direction,rough)*1.2;
+    float floorFactor=smoothstep(0.05,-0.25,direction.y);
+    vec3 floorColor=roughRoom(direction,rough)*0.35;
     return mix(probeColor,floorColor,floorFactor);
 }
 float coneLight(vec3 p,vec3 start,vec3 target,float width){
@@ -322,13 +322,23 @@ void main(){
         surface_height=.00016*press+.00010*fleck;
     }
     else if(material_kind>18.5 && material_kind<19.5){ // engine-turned gold shell
-        float a=atan(original_pos.z,original_pos.x),r=length(original_pos.xz);
-        float cut=sin(r*92.0+sin(a*24.0)*1.7);
+        float r=length(original_pos.xz);
+        vec2 u=r>1e-6?original_pos.xz/r:vec2(1.0,0.0);
+        // Compute sin(24a) and sin(32a) analytically via polynomial angle-doubling,
+        // eliminating the atan(z,x) branch cut jump and the resulting dFdx/dFdy normal crease.
+        vec2 u2=vec2(u.x*u.x-u.y*u.y,2.0*u.x*u.y);
+        vec2 u4=vec2(u2.x*u2.x-u2.y*u2.y,2.0*u2.x*u2.y);
+        vec2 u8=vec2(u4.x*u4.x-u4.y*u4.y,2.0*u4.x*u4.y);
+        float sin24=3.0*u8.y-4.0*u8.y*u8.y*u8.y;
+        vec2 u16=vec2(u8.x*u8.x-u8.y*u8.y,2.0*u8.x*u8.y);
+        float sin32=2.0*u16.x*u16.y;
+        float poleFade=smoothstep(0.0,0.05,r);
+        float cut=sin(r*92.0+sin24*1.7*poleFade);
         float aa=exp(-length(fwidth(original_pos.xz))*92.0);
-        float facets=sin(a*32.0)*exp(-abs(fwidth(a))*32.0);
+        float facets=sin32*aa*poleFade;
         albedo*=1.0+.075*cut*aa+.035*facets;
         rough=clamp(rough+.065*cut*aa,.24,.45);
-        surface_height=.00012*cut*aa;
+        surface_height=.00012*cut*aa*poleFade;
     }
     else if(material_kind>19.5 && material_kind<20.5){ // readable short velvet nap
         float aa=exp(-length(fwidth(original_pos.xz))*125.0);

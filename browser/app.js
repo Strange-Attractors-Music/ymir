@@ -6,7 +6,7 @@ const readOnly=typeof __YMIR_READ_ONLY__!=='undefined'&&__YMIR_READ_ONLY__;
 
 const MIN_ZOOM = 0.55; // Prevent camera from entering inside model geometry
 const MAX_ZOOM = 3.5;
-const DRAG_THRESHOLD = 8; // Pixel distance to distinguish tap/click from drag/orbit
+const DRAG_THRESHOLD = 8; // Pixel distance threshold to distinguish tap/click from drag/orbit
 
 let renderer,world,transforms,previewTransition=null;
 let turn=0,tilt=0,zoom=1,generation=0,dirty=false;
@@ -252,29 +252,38 @@ function highlightSelected(){
 }
 
 function onPartSelected(slotId,partId){
-  if(readOnly||!['prop','model'].includes(currentEntry?.type))return;
+  if(readOnly)return;
   selectedSlot=slotId;
   selectedPart=partId;
   highlightSelected();
 
   const modelData=surfaceState?.modelData||currentEntry;
-  const slot=modelData?.slots?.find(s=>(s.id===slotId||s.slotId===slotId));
-  const part=modelData?.parts?.find(p=>(p.id===partId||p.partId===partId));
+  const slots=modelData?.slots||[];
+  const parts=modelData?.parts||[];
+  const slot=slots.find(s=>(s.id===slotId||s.slotId===slotId));
+  const part=parts.find(p=>(p.id===partId||p.partId===partId));
   const group=selectedGroup();
 
-  const title=slot?slot.name:(part?.name||'Selected Part');
-  $('part-card-title').textContent=title;
-  $('part-card').hidden=false;
+  const title=slot?.name||part?.name||slotId||partId||'Selected Part';
+  const titleEl=$('part-card-title');
+  if(titleEl)titleEl.textContent=title;
+  const card=$('part-card');
+  if(card)card.hidden=false;
 
   const assigned=getEffectiveAssignment(slotId);
-  const currentMatId=assigned?.material?.id||library.catalog.assets.find(a=>a.type==='material')?.id;
+  const fallbackMat=library.catalog.assets.find(a=>a.type==='material');
+  const currentMatId=assigned?.material?.id||fallbackMat?.id;
   fillResources($('slot-material'),'material',currentMatId);
 
-  const mat=library.catalog.assets.find(a=>a.id===currentMatId);
+  const mat=library.catalog.assets.find(a=>a.id===currentMatId)||fallbackMat;
   const currentColorId=assigned?.color?.id!==undefined?assigned.color.id:(group?.usesDefaultColor?'':(group?.colorId??''));
   fillColorResources($('slot-color'),mat,currentColorId);
 
-  $('group-toggle').checked=Boolean(group&&group.slotIds?.length>1);
+  const groupToggle=$('group-toggle');
+  if(groupToggle)groupToggle.checked=Boolean(group&&group.slotIds?.length>1);
+
+  dirty=true;
+  draw();
 }
 
 function applyStagedAssignment(){
@@ -558,8 +567,10 @@ function pickPart(clientX,clientY){
       if(distance>0&&distance<nearest){nearest=distance;hit=node;}
     }
   }
-  if(hit?.partId&&hit?.surfaceSlot){
-    onPartSelected(hit.surfaceSlot,hit.partId);
+  const slotId=hit?.surfaceSlot||hit?.slotId;
+  const partId=hit?.partId||hit?.id;
+  if(hit&&(slotId||partId)){
+    onPartSelected(slotId||partId,partId||slotId);
   }
 }
 
@@ -599,7 +610,7 @@ if(drawerBackdrop){
   drawerBackdrop.onclick=collapseSidebar;
 }
 
-// Window-level dismiss: tap or drag outside drawer collapses mobile sidebar immediately
+// Window-level dismiss: any tap or drag outside drawer collapses mobile sidebar immediately
 window.addEventListener('pointerdown',e=>{
   if(window.innerWidth<=768&&sidebarDrawer&&!sidebarDrawer.classList.contains('drawer-closed')){
     if(!e.target.closest('#sidebar-drawer')&&!e.target.closest('#toggle-sidebar')){
@@ -810,108 +821,107 @@ if(readOnly)for(const id of ['new-color','delete','edit'])$(id).hidden=true;
 
 list();
 
-// Touch & Pointer Gesture Controls (Desktop Mouse & Mobile Touch)
+// Touch & Pointer Gesture Controls (Universal Desktop & Mobile Implementation)
 preview.style.touchAction='none';
 preview.style.cursor='grab';
 
-const activePointers=new Map();
+let pointerDownData=null;
+let isDragging=false;
+const activeTouches=new Map();
 let pinchStartDist=0;
 let pinchStartZoom=1;
 
-preview.onpointerdown=e=>{
+preview.addEventListener('pointerdown',e=>{
   // On mobile or anytime canvas is touched, auto-collapse sidebar drawer immediately
   collapseSidebar();
 
   if(e.pointerType==='mouse'&&e.button!==0&&e.button!==1)return;
-  e.preventDefault();
-  preview.setPointerCapture(e.pointerId);
-  activePointers.set(e.pointerId,{
-    startX:e.clientX,
-    startY:e.clientY,
-    x:e.clientX,
-    y:e.clientY,
-    pointerType:e.pointerType,
-    button:e.button,
-    downTime:Date.now(),
-    isDragging:false
-  });
-  if(activePointers.size===1){
-    preview.style.cursor='grabbing';
-  }else if(activePointers.size===2){
-    const [p1,p2]=Array.from(activePointers.values());
-    pinchStartDist=Math.hypot(p1.x-p2.x,p1.y-p2.y);
+
+  activeTouches.set(e.pointerId,{x:e.clientX,y:e.clientY});
+
+  if(activeTouches.size===1){
+    pointerDownData={
+      pointerId:e.pointerId,
+      startX:e.clientX,
+      startY:e.clientY,
+      lastX:e.clientX,
+      lastY:e.clientY,
+      time:Date.now(),
+      pointerType:e.pointerType,
+      button:e.button
+    };
+    isDragging=false;
+  }else if(activeTouches.size===2){
+    const [t1,t2]=Array.from(activeTouches.values());
+    pinchStartDist=Math.hypot(t1.x-t2.x,t1.y-t2.y);
     pinchStartZoom=zoom;
   }
-};
+});
 
-preview.onpointermove=e=>{
-  if(!activePointers.has(e.pointerId))return;
-  const p=activePointers.get(e.pointerId);
-  const dx=e.clientX-p.x;
-  const dy=e.clientY-p.y;
-  p.x=e.clientX;
-  p.y=e.clientY;
+window.addEventListener('pointermove',e=>{
+  if(activeTouches.has(e.pointerId)){
+    activeTouches.set(e.pointerId,{x:e.clientX,y:e.clientY});
+  }
+  if(!pointerDownData||pointerDownData.pointerId!==e.pointerId)return;
 
-  // Once finger/mouse moves beyond DRAG_THRESHOLD, switch to drag/orbit mode
-  if(!p.isDragging&&Math.hypot(e.clientX-p.startX,e.clientY-p.startY)>DRAG_THRESHOLD){
-    p.isDragging=true;
-    collapseSidebar(); // Also collapse on tap+drag motion
+  const dx=e.clientX-pointerDownData.lastX;
+  const dy=e.clientY-pointerDownData.lastY;
+  pointerDownData.lastX=e.clientX;
+  pointerDownData.lastY=e.clientY;
+
+  const distFromStart=Math.hypot(e.clientX-pointerDownData.startX,e.clientY-pointerDownData.startY);
+  if(!isDragging&&distFromStart>DRAG_THRESHOLD){
+    isDragging=true;
+    preview.style.cursor='grabbing';
+    collapseSidebar();
   }
 
-  if(activePointers.size===1&&p.isDragging){
-    // Both desktop left-click/middle-click drag AND mobile touch drag perform two-axis orbit:
-    // down=CCW on X, up=CW on X; right=CCW on Y, left=CW on Y
+  if(activeTouches.size===1&&isDragging){
+    // Two-axis orbit on both desktop left-click and mobile touch drag
     ({turn,tilt}=applyOrbitDrag(turn,tilt,1,dx,dy));
     dirty=true;
-  }else if(activePointers.size===2){
-    // Two-finger gesture: pinch to zoom out, spread to zoom in
-    const [p1,p2]=Array.from(activePointers.values());
-    const currentDist=Math.hypot(p1.x-p2.x,p1.y-p2.y);
+  }else if(activeTouches.size===2){
+    const [t1,t2]=Array.from(activeTouches.values());
+    const currentDist=Math.hypot(t1.x-t2.x,t1.y-t2.y);
     if(pinchStartDist>0&&currentDist>0){
-      // Spreading fingers apart: currentDist > pinchStartDist -> ratio < 1 -> zoom distance decreases -> ZOOMS IN!
-      // Pinching fingers together: currentDist < pinchStartDist -> ratio > 1 -> zoom distance increases -> ZOOMS OUT!
       const ratio=pinchStartDist/currentDist;
       zoom=Math.max(MIN_ZOOM,Math.min(MAX_ZOOM,pinchStartZoom*ratio));
       dirty=true;
     }
   }
-};
+});
 
-function endPointer(e){
-  if(!activePointers.has(e.pointerId))return;
-  const p=activePointers.get(e.pointerId);
-  const wasSingle=activePointers.size===1;
-  const elapsed=Date.now()-p.downTime;
-  const dist=Math.hypot(e.clientX-p.startX,e.clientY-p.startY);
-  const isClick=wasSingle&&!p.isDragging&&dist<=DRAG_THRESHOLD&&elapsed<500;
+window.addEventListener('pointerup',e=>{
+  activeTouches.delete(e.pointerId);
 
-  activePointers.delete(e.pointerId);
-  if(preview.hasPointerCapture(e.pointerId)){
-    preview.releasePointerCapture(e.pointerId);
-  }
+  if(pointerDownData&&pointerDownData.pointerId===e.pointerId){
+    const distFromStart=Math.hypot(e.clientX-pointerDownData.startX,e.clientY-pointerDownData.startY);
+    const elapsed=Date.now()-pointerDownData.time;
 
-  if(activePointers.size===0){
+    // Clean tap or click without dragging
+    if(!isDragging&&distFromStart<=DRAG_THRESHOLD&&elapsed<600){
+      pickPart(pointerDownData.startX,pointerDownData.startY);
+    }
+
+    pointerDownData=null;
+    isDragging=false;
     preview.style.cursor='grab';
     pinchStartDist=0;
-  }else if(activePointers.size===1){
-    const remaining=activePointers.values().next().value;
-    remaining.x=remaining.startX=e.clientX;
-    remaining.y=remaining.startY=e.clientY;
-    remaining.isDragging=true;
   }
 
-  if(isClick&&(p.pointerType==='touch'||p.pointerType==='pen'||p.button===0)){
-    pickPart(p.startX,p.startY);
+  if(activeTouches.size===0){
+    preview.style.cursor='grab';
+    pinchStartDist=0;
   }
-}
+});
 
-preview.onpointerup=endPointer;
-preview.onpointercancel=endPointer;
-preview.onlostpointercapture=()=>{
-  activePointers.clear();
+window.addEventListener('pointercancel',()=>{
+  activeTouches.clear();
+  pointerDownData=null;
+  isDragging=false;
   preview.style.cursor='grab';
   pinchStartDist=0;
-};
+});
 
 preview.addEventListener('auxclick',e=>{if(e.button===1)e.preventDefault();});
 preview.addEventListener('wheel',e=>{
@@ -926,7 +936,7 @@ preview.addEventListener('wheel',e=>{
 
 let previous=0,lastDraw=0;
 function animate(t){
-  const spinning=turntableOn&&activePointers.size===0&&!document.hidden;
+  const spinning=turntableOn&&activeTouches.size===0&&!document.hidden;
   if(spinning&&renderer){
     turn+=(previous?Math.min(t-previous,100):0)*.025;
     dirty=true;

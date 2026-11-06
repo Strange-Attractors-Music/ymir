@@ -1,17 +1,26 @@
 import {loadLibrary,resolveColor,groupSurfaceAssignments,surfaceAssignmentName,createRenderer,model,multiply,lookAt,perspective,unit,sub,cross,dot} from 'trinity';
 import {BASE_ELEVATION,applyOrbitDrag} from './orbit-controls.js';
+
 const $=id=>document.getElementById(id);
 const readOnly=typeof __YMIR_READ_ONLY__!=='undefined'&&__YMIR_READ_ONLY__;
-let renderer,world,transforms,previewTransition=null,turn=0,tilt=0,zoom=1,generation=0,dirty=false,drag=null;
+
+let renderer,world,transforms,previewTransition=null;
+let turn=0,tilt=0,zoom=1,generation=0,dirty=false,drag=null;
 let currentEntry,currentVariant,editState,editTargetState,deleteState;
-let surfaceState,selectedSlot,pickMeshes,lastCamera;
+let surfaceState,selectedSlot=null,selectedPart=null,pickMeshes=[],lastCamera;
+let turntableOn=false;
+const stagedChanges=new Map(); // slotId -> { materialId, colorId }
+let pendingSwitchAction=null;
+
 const library=await loadLibrary(new URL('../',import.meta.url)).catch(e=>{$('error').textContent=e.message;throw e;});
 const libraries=new Map();
+
 async function libraryFor(entry){
   const suiteManifest=entry.suiteManifest??'materials/ymir-surfaces-v1/suite.json';
   if(!libraries.has(suiteManifest))libraries.set(suiteManifest,loadLibrary(new URL('../',import.meta.url),{suiteManifest}));
   return libraries.get(suiteManifest);
 }
+
 function swatch(material,color){
   color={...color,parameters:resolveColor(library.catalog,color.id)};
   const vertices=[],indices=[],nu=64,nv=33;
@@ -24,19 +33,36 @@ function swatch(material,color){
   return {raw:bytes.buffer,asset:{bounds:[[-1,-1,-1],[1,1,1]]},nodes:[{vertex_offset:0,index_offset:vv.byteLength,vertex_count:vertices.length/8,index_count:indices.length,
     ...material.parameters,color:color.parameters.primary,colorData:color.parameters,kind:material.profile,pos:[0,0,0],rot:[0,0,0],scale:[1,1,1],assembly:0,deformability:0,label:'material swatch',surface_center:[0,0,0],surface_normal:[0,0,1]}]};
 }
+
 async function select(entry,{variant=entry.defaultVariant,previewMaterial,previewColor}={}){
   const preserveView=currentEntry?.id===entry.id;
   previewTransition=null;
-  currentEntry=entry;currentVariant=variant;
-  const modelEntry=library.catalog.assets.find(a=>a.id===entry.modelId);
-  const related=library.catalog.assets.filter(a=>a.type==='prop'&&a.modelId===(entry.modelId??entry.id));
-  $('prop').replaceChildren(...(entry.type==='model'?[new Option('Neutral model preview',entry.id)]:[]),...related.map(p=>new Option(p.name,p.id)));$('prop').value=entry.id;
-  $('prop-control').hidden=!['prop','model'].includes(entry.type)||!related.length;
-  $('model-info').textContent=entry.type==='model'?`Independent geometry · ${related.length} prop(s) use this model · neutral shader preview`:modelEntry?`Model: ${modelEntry.name}`:'';
-  const variants=$('variant');variants.replaceChildren();
-  for(const v of entry.variants??[]){const option=document.createElement('option');option.value=v.id;option.textContent=v.name;variants.append(option);}
-  variants.value=variant??'';$('variant-control').hidden=!entry.variants?.length;$('edit').disabled=$('delete').disabled=false;
-  const token=++generation;$('error').textContent='';$('title').textContent=entry.name;
+  currentEntry=entry;
+  currentVariant=variant;
+  stagedChanges.clear();
+  updateSaveCheckVisibility();
+  if($('part-card'))$('part-card').hidden=true;
+  selectedSlot=null;selectedPart=null;
+
+  const variants=$('variant');
+  if(variants){
+    variants.replaceChildren();
+    for(const v of entry.variants??[]){
+      const option=document.createElement('option');
+      option.value=v.id;
+      option.textContent=v.name;
+      variants.append(option);
+    }
+    variants.value=variant??'';
+  }
+  const variantControl=$('variant-control');
+  if(variantControl)variantControl.hidden=!entry.variants?.length;
+  $('edit').disabled=$('delete').disabled=false;
+
+  const token=++generation;
+  $('error').textContent='';
+  $('title').textContent=entry.name;
+
   try{
     const selectedLibrary=await libraryFor(entry);
     const material=library.catalog.assets.find(a=>a.id===(previewMaterial??(entry.type==='material'?entry.id:'grwm/woven-satin@3')))??library.catalog.assets.find(a=>a.type==='material');
@@ -45,13 +71,15 @@ async function select(entry,{variant=entry.defaultVariant,previewMaterial,previe
     if(['material','color'].includes(entry.type)&&(!material||!color))throw new Error('Pairing previews need an existing Material and named Color. Define a Color palette resource first if none exists.');
     const prop=entry.type==='prop'?await selectedLibrary.loadProp(entry.manifest,{variant}):entry.type==='model'?await selectedLibrary.loadModel(entry.manifest):swatch(material,color);
     if(token!==generation)return;
-    renderer?.dispose();renderer=null;if(!preserveView){turn=0;tilt=0;zoom=1;}
+    renderer?.dispose();renderer=null;
+    if(!preserveView){turn=0;tilt=0;zoom=1;}
     const isMaterialSwatch=['material','color'].includes(entry.type),previewNodes=prop.nodes.map(n=>({...n,assembly:0}));
     world={index:0,start_s:0,end_s:1,background:[.58,.40,.34],accent:[.55,.12,.18],nodes:isMaterialSwatch?[]:previewNodes,rigs:[{pos:[0,0,0]}]};
     if(entry.preview==='backdrop')world.nodes=[];
     const transition={meshData:prop.raw,vertex_offset:0,...prop.nodes[0]};
     const candidate=await createRenderer({canvas:$('preview'),book:{worlds:[{...world,meshData:prop.raw}],transition},shaders:selectedLibrary.shaders,quality:{shadowSize:2048,cacheEnvironment:true,synchronize:false}});
-    if(token!==generation){candidate.dispose();return;}renderer=candidate;
+    if(token!==generation){candidate.dispose();return;}
+    renderer=candidate;
     world.bounds=prop.asset.bounds;
     const transformFor=n=>{
       let matrix=model(n.pos,n.scale,n.rot);
@@ -65,189 +93,615 @@ async function select(entry,{variant=entry.defaultVariant,previewMaterial,previe
       const points=[];for(let i=0;i<vertices.length;i+=8){const v=vertices.subarray(i,i+3);points.push([0,1,2].map(k=>matrix[k]*v[0]+matrix[k+4]*v[1]+matrix[k+8]*v[2]+matrix[k+12]));}
       return {node:n,points,indices:new Uint32Array(prop.raw,n.index_offset,n.index_count)};
     }):[];
-    $('details').textContent=JSON.stringify({asset:entry,...(modelEntry?{model:{id:modelEntry.id,name:modelEntry.name,partCount:modelEntry.partCount}}:{}),...(variant?{selectedVariant:entry.variants?.find(v=>v.id===variant)}:{})},null,2);
-    $('swatch-controls').hidden=!['material','color'].includes(entry.type);
-    if(!$('swatch-controls').hidden){fillResources($('swatch-material'),'material',material.id);fillColorResources($('swatch-color'),material,previewColor===undefined&&entry.type==='material'||previewColor===''?'':color.id);$('save-material-default').hidden=readOnly||entry.type!=='material';$('save-material-default').disabled=!$('swatch-color').value;$('material-default-status').textContent='';}
-    $('surface-editor').hidden=readOnly||!['prop','model'].includes(entry.type);
-    if(!$('surface-editor').hidden){surfaceState=await api(`/api/asset?id=${encodeURIComponent(entry.id)}`);if(token!==generation)return;configureSurface(entry.type==='model'?prop.asset:surfaceState.model);}
-    for(const button of $('list').children)button.setAttribute('aria-pressed',button.dataset.id===entry.id||$('type').value==='prop'&&button.dataset.id===entry.modelId?'true':'false');
+
+    const swatchControls=$('swatch-controls');
+    if(swatchControls){
+      swatchControls.hidden=!['material','color'].includes(entry.type);
+      if(!swatchControls.hidden){
+        fillResources($('swatch-material'),'material',material.id);
+        fillColorResources($('swatch-color'),material,previewColor===undefined&&entry.type==='material'||previewColor===''?'':color.id);
+        $('save-material-default').hidden=readOnly||entry.type!=='material';
+        $('save-material-default').disabled=!$('swatch-color').value;
+        $('material-default-status').textContent='';
+      }
+    }
+
+    if(['prop','model'].includes(entry.type)){
+      surfaceState=await api(`/api/asset?id=${encodeURIComponent(entry.id)}`);
+      if(token!==generation)return;
+      configureSurface(entry.type==='model'?prop.asset:surfaceState.model);
+    }
+
+    for(const button of $('list').children){
+      button.setAttribute('aria-pressed',button.dataset.id===entry.id||$('type').value==='prop'&&button.dataset.id===entry.modelId?'true':'false');
+    }
+    resizeCanvas();
     draw();
-  }catch(e){if(token===generation)$('error').textContent=e.stack??e.message;}
+  }catch(e){
+    if(token===generation)$('error').textContent=e.stack??e.message;
+  }
 }
-function fillResources(select,type,id){select.replaceChildren(...library.catalog.assets.filter(a=>a.type===type).sort((a,b)=>a.name.localeCompare(b.name)).map(a=>new Option(a.name,a.id)));select.value=id??'';}
-function fillColorResources(select,material,id){fillResources(select,'color',id);const color=library.catalog.assets.find(a=>a.id===material.defaultColorId);if(color)select.prepend(new Option(`Material default — ${color.name}`,''));select.value=id??'';}
+
+function fillResources(select,type,id){
+  select.replaceChildren(...library.catalog.assets.filter(a=>a.type===type).sort((a,b)=>a.name.localeCompare(b.name)).map(a=>new Option(a.name,a.id)));
+  select.value=id??'';
+}
+
+function fillColorResources(select,material,id){
+  fillResources(select,'color',id);
+  const color=library.catalog.assets.find(a=>a.id===material.defaultColorId);
+  if(color)select.prepend(new Option(`Material default — ${color.name}`,''));
+  select.value=id??'';
+}
+
 function configureSurface(model){
   surfaceState.modelData=model;
-  const slots=model.slots??[];if(!slots.some(s=>s.id===selectedSlot))selectedSlot=slots[0]?.id;
-  $('slot-select').replaceChildren(...slots.map(s=>new Option(s.name,s.id)));$('slot-select').value=selectedSlot??'';
-  $('part-select').replaceChildren(new Option('All parts in this slot',''),...model.parts.map(p=>new Option(p.name??p.id,p.id)));
-  const overrides=surfaceState.variantSlots.find(v=>v.id===currentVariant)?.slots??[];
+  const overrides=surfaceState.variantSlots?.find(v=>v.id===currentVariant)?.slots??[];
   surfaceState.groups=currentEntry.type==='prop'?groupSurfaceAssignments(library.catalog,model,surfaceState.slots,overrides):[];
-  $('surface-group-controls').hidden=currentEntry.type!=='prop';
-  $('surface-group').replaceChildren(...surfaceState.groups.map(g=>new Option(`${g.name} · ${g.slotIds.length} slots / ${g.partIds.length} parts`,g.id)));
-  $('assignment-controls').hidden=currentEntry.type!=='prop';$('assignment-error').textContent='';loadSlot();
 }
-function grouped(){return currentEntry.type==='prop'&&$('surface-scope').value==='pair';}
-function selectedGroup(){return surfaceState.groups.find(g=>g.slotIds.includes(selectedSlot));}
-function selectedSlotIds(){return grouped()?(selectedGroup()?.slotIds??[]):[selectedSlot];}
-function loadSlot(){
-  selectedSlot=$('slot-select').value;
-  const slot=surfaceState.modelData.slots.find(s=>s.id===selectedSlot);
-  const group=selectedGroup();$('surface-group').value=group?.id??'';$('surface-group-label').hidden=!grouped();
-  $('slot-info').textContent=grouped()&&group?`${group.name} · ${group.slotIds.length} model slots / ${group.partIds.length} parts. Preview and save update this entire group.${group.mixedColorInheritance?' This group mixes inherited and explicit Colors; saving applies your chosen Color mode to all.':''}`:slot?`${slot.name} · ${slot.partIds.length} part(s). Assigning this slot updates all of them.`:'';
-  const selected=surfaceState.variantSlots.find(v=>v.id===currentVariant);
-  const assignment=[...surfaceState.slots,...(selected?.slots??[])].findLast(s=>s.slotId===selectedSlot);
-  if(assignment){
-    const material=library.catalog.assets.find(a=>a.id===assignment.material.id);
-    fillResources($('slot-material'),'material',assignment.material.id);
-    const option=$('slot-material').selectedOptions[0];
-    option.textContent=surfaceAssignmentName(material,assignment);
-    option.title=`${material.name}; existing slot settings retained. This is a descriptive label, not a different Material.`;
-    fillColorResources($('slot-color'),material,grouped()&&group?(group.usesDefaultColor?'':group.colorId):assignment.color?.id);
+
+function selectedGroup(){
+  return surfaceState?.groups?.find(g=>g.slotIds.includes(selectedSlot));
+}
+
+function getEffectiveAssignment(slotId){
+  if(stagedChanges.has(slotId)){
+    const st=stagedChanges.get(slotId);
+    return {material:{id:st.materialId},color:{id:st.colorId}};
   }
-  highlight();
+  const selected=surfaceState?.variantSlots?.find(v=>v.id===currentVariant);
+  return [...(surfaceState?.slots??[]),...(selected?.slots??[])].findLast(s=>s.slotId===slotId);
 }
-function highlight(){const ids=selectedSlotIds();for(const n of world?.nodes??[])n.highlight=$('highlight-slot').checked&&(grouped()?ids.includes(n.surfaceSlot):$('part-select').value?n.partId===$('part-select').value:n.surfaceSlot===selectedSlot);dirty=true;}
-$('surface-group').onchange=()=>{const group=surfaceState.groups.find(g=>g.id===$('surface-group').value);if(group){$('slot-select').value=group.slotIds[0];$('part-select').value='';loadSlot();}};
-$('surface-scope').onchange=loadSlot;
-$('slot-select').onchange=()=>{$('part-select').value='';loadSlot();};
-$('part-select').onchange=()=>{const part=surfaceState.modelData.parts.find(p=>p.id===$('part-select').value);if(part){$('slot-select').value=part.slotId;loadSlot();}else highlight();};
-$('highlight-slot').onchange=highlight;
-function previewAssignment(){
-  const material=library.catalog.assets.find(a=>a.id===$('slot-material').value),color=library.catalog.assets.find(a=>a.id===($('slot-color').value||material.defaultColorId));
-  const colorData=resolveColor(library.catalog,color.id);
-  const ids=selectedSlotIds(),assignments=[...surfaceState.slots,...(surfaceState.variantSlots.find(v=>v.id===currentVariant)?.slots??[])];
-  for(const n of world.nodes)if(ids.includes(n.surfaceSlot)){
-    const saved=assignments.findLast(s=>s.slotId===n.surfaceSlot),parameters={...material.parameters,...(saved?.material.id===material.id?saved.material.parameters:{})};
-    Object.assign(n,parameters,{kind:material.profile,color:colorData.primary,colorData,gold_finish:parameters.gold_finish??false});
+
+function getTargetSlotIds(){
+  if(!selectedSlot)return [];
+  const groupToggle=$('group-toggle');
+  if(groupToggle?.checked){
+    const grp=selectedGroup();
+    return grp?grp.slotIds:[selectedSlot];
   }
-  world={...world}; // Invalidate the static environment probe after an appearance change.
-  dirty=true;$('assignment-error').textContent='Preview only until saved.';
+  return [selectedSlot];
 }
-$('slot-material').onchange=()=>{const id=$('slot-color').value;fillColorResources($('slot-color'),library.catalog.assets.find(a=>a.id===$('slot-material').value),id);previewAssignment();};$('slot-color').onchange=previewAssignment;
-$('assignment-target').onchange=()=>{$('new-variant-name').hidden=$('assignment-target').value!=='new-variant';};
-$('save-assignment').onclick=async()=>{try{
-  $('save-assignment').disabled=true;const target=$('assignment-target').value;const {token}=await api('/api/session');
-  const result=await api(`/api/asset?id=${encodeURIComponent(currentEntry.id)}`,{method:'PUT',headers:{'content-type':'application/json','x-ymir-token':token},body:JSON.stringify({revision:surfaceState.revision,variantId:currentVariant,appearance:{slotIds:selectedSlotIds(),materialId:$('slot-material').value,colorId:$('slot-color').value,target:$('assignment-target').value,newVariantName:$('new-variant-name').value}})});
-  currentVariant=result.variantId;await refresh(currentEntry.id);if(target==='new-variant'){$('assignment-target').value='variant';$('new-variant-name').hidden=true;}$('assignment-error').textContent='Surface assignment saved.';
-}catch(e){$('assignment-error').textContent=e.message;}finally{$('save-assignment').disabled=false;}};
+
+function highlightSelected(){
+  const ids=getTargetSlotIds();
+  for(const n of world?.nodes??[]){
+    n.highlight=Boolean(selectedSlot&&ids.includes(n.surfaceSlot));
+  }
+  dirty=true;
+}
+
+function onPartSelected(slotId,partId){
+  if(readOnly||currentEntry?.type!=='prop')return;
+  selectedSlot=slotId;
+  selectedPart=partId;
+  highlightSelected();
+
+  const slot=surfaceState?.modelData?.slots?.find(s=>s.id===slotId);
+  const part=surfaceState?.modelData?.parts?.find(p=>p.id===partId);
+  const group=selectedGroup();
+
+  const title=slot?slot.name:(part?.name||'Selected Part');
+  $('part-card-title').textContent=title;
+  $('part-card').hidden=false;
+
+  const assigned=getEffectiveAssignment(slotId);
+  const currentMatId=assigned?.material?.id||library.catalog.assets.find(a=>a.type==='material')?.id;
+  fillResources($('slot-material'),'material',currentMatId);
+
+  const mat=library.catalog.assets.find(a=>a.id===currentMatId);
+  const currentColorId=assigned?.color?.id!==undefined?assigned.color.id:(group?.usesDefaultColor?'':(group?.colorId??''));
+  fillColorResources($('slot-color'),mat,currentColorId);
+
+  $('group-toggle').checked=true;
+}
+
+function applyStagedAssignment(){
+  if(!selectedSlot)return;
+  const matId=$('slot-material').value;
+  const colId=$('slot-color').value;
+  const targetSlots=getTargetSlotIds();
+
+  for(const slotId of targetSlots){
+    stagedChanges.set(slotId,{materialId:matId,colorId:colId});
+  }
+
+  updateLiveNodes();
+  updateSaveCheckVisibility();
+  highlightSelected();
+}
+
+function updateLiveNodes(){
+  if(!world?.nodes)return;
+  const assignments=[...(surfaceState?.slots??[]),...(surfaceState?.variantSlots?.find(v=>v.id===currentVariant)?.slots??[])];
+
+  for(const n of world.nodes){
+    if(stagedChanges.has(n.surfaceSlot)){
+      const {materialId,colorId}=stagedChanges.get(n.surfaceSlot);
+      const material=library.catalog.assets.find(a=>a.id===materialId);
+      if(!material)continue;
+      const color=library.catalog.assets.find(a=>a.id===(colorId||material.defaultColorId));
+      const colorData=color?resolveColor(library.catalog,color.id):{primary:[1,1,1]};
+      const saved=assignments.findLast(s=>s.slotId===n.surfaceSlot);
+      const parameters={...material.parameters,...(saved?.material?.id===material.id?saved.material.parameters:{})};
+      Object.assign(n,parameters,{
+        kind:material.profile,
+        color:colorData.primary,
+        colorData,
+        gold_finish:parameters.gold_finish??false
+      });
+    }
+  }
+  world={...world};
+  dirty=true;
+}
+
+function updateSaveCheckVisibility(){
+  const btn=$('save-check-btn');
+  if(btn)btn.hidden=(stagedChanges.size===0);
+}
+
+// Turntable toggle button
+$('turntable-btn').onclick=()=>{
+  turntableOn=!turntableOn;
+  $('turntable-btn').setAttribute('aria-pressed',turntableOn?'true':'false');
+  $('turntable-btn').classList.toggle('active',turntableOn);
+  dirty=true;
+};
+
+// Part Popover card listeners
+$('close-part-card').onclick=()=>{
+  $('part-card').hidden=true;
+  selectedSlot=null;
+  selectedPart=null;
+  highlightSelected();
+};
+$('group-toggle').onchange=highlightSelected;
+$('slot-material').onchange=()=>{
+  const colId=$('slot-color').value;
+  fillColorResources($('slot-color'),library.catalog.assets.find(a=>a.id===$('slot-material').value),colId);
+  applyStagedAssignment();
+};
+$('slot-color').onchange=applyStagedAssignment;
+
+// Save Variant Floating Checkmark Button
+$('save-check-btn').onclick=()=>{
+  if(stagedChanges.size===0)return;
+  $('new-variant-name').value='';
+  $('save-variant-error').textContent='';
+  $('save-variant-dialog').showModal();
+};
+
+$('close-save-variant').onclick=()=>{
+  $('save-variant-dialog').close();
+};
+
+$('save-variant-form').onsubmit=async e=>{
+  e.preventDefault();
+  const name=$('new-variant-name').value.trim();
+  if(!name)return;
+  const submitBtn=$('submit-save-variant');
+  submitBtn.disabled=true;
+  $('save-variant-error').textContent='';
+  try{
+    const {token}=await api('/api/session');
+    const assignments=Array.from(stagedChanges.entries()).map(([slotId,{materialId,colorId}])=>({
+      slotId,
+      materialId,
+      colorId
+    }));
+    const result=await api(`/api/asset?id=${encodeURIComponent(currentEntry.id)}`,{
+      method:'PUT',
+      headers:{'content-type':'application/json','x-ymir-token':token},
+      body:JSON.stringify({
+        revision:surfaceState.revision,
+        variantId:currentVariant,
+        appearance:{
+          target:'new-variant',
+          newVariantName:name,
+          assignments
+        }
+      })
+    });
+    stagedChanges.clear();
+    updateSaveCheckVisibility();
+    $('part-card').hidden=true;
+    selectedSlot=null;
+    highlightSelected();
+    $('save-variant-dialog').close();
+    currentVariant=result.variantId;
+    await refresh(currentEntry.id);
+  }catch(err){
+    $('save-variant-error').textContent=err.message;
+  }finally{
+    submitBtn.disabled=false;
+  }
+};
+
+// Confirmation when switching variant or asset with unsaved changes
+function requestSwitch(action){
+  if(stagedChanges.size>0){
+    pendingSwitchAction=action;
+    $('confirm-switch-dialog').showModal();
+  }else{
+    action();
+  }
+}
+
+$('cancel-switch-btn').onclick=()=>{
+  $('confirm-switch-dialog').close();
+  pendingSwitchAction=null;
+  if($('variant'))$('variant').value=currentVariant;
+};
+
+$('confirm-discard-btn').onclick=()=>{
+  stagedChanges.clear();
+  updateSaveCheckVisibility();
+  $('part-card').hidden=true;
+  selectedSlot=null;
+  $('confirm-switch-dialog').close();
+  const act=pendingSwitchAction;
+  pendingSwitchAction=null;
+  if(act)act();
+};
+
+$('variant').onchange=()=>{
+  const targetVariant=$('variant').value;
+  if(targetVariant===currentVariant)return;
+  requestSwitch(()=>{
+    select(currentEntry,{variant:targetVariant});
+  });
+  if(stagedChanges.size>0){
+    $('variant').value=currentVariant;
+  }
+};
+
+// Swatch controls for Material/Color previews
 for(const id of ['swatch-material','swatch-color'])$(id).onchange=()=>select(currentEntry,{previewMaterial:$('swatch-material').value,previewColor:$('swatch-color').value});
-$('save-material-default').onclick=async()=>{try{
-  $('save-material-default').disabled=true;const id=$('swatch-material').value,colorId=$('swatch-color').value;
-  const state=await api(`/api/asset?id=${encodeURIComponent(id)}`),{token}=await api('/api/session');
-  await api(`/api/asset?id=${encodeURIComponent(id)}`,{method:'PUT',headers:{'content-type':'application/json','x-ymir-token':token},body:JSON.stringify({revision:state.revision,defaultColorId:colorId})});
-  library.catalog=await api('/ymir/catalog.json');libraries.clear();list();
-  await select(library.catalog.assets.find(a=>a.id===currentEntry.id),{previewMaterial:id,previewColor:''});$('material-default-status').textContent='Material default Color saved. Explicit prop/variant Color overrides are unchanged.';
-}catch(e){$('material-default-status').textContent=e.message;$('save-material-default').disabled=false;}};
-$('new-color').onclick=()=>{const palette=library.catalog.assets.filter(a=>a.type==='color'&&a.parameters.pattern===-1).sort((a,b)=>a.name.localeCompare(b.name));for(const id of ['color-primary','color-secondary'])$(id).replaceChildren(...palette.map(c=>new Option(c.name,c.id)));$('color-name').value='';$('color-error').textContent='';$('color-dialog').showModal();};
-$('color-generator').onchange=()=>{const solid=$('color-generator').value==='solid';$('solid-color-field').hidden=!solid;$('pattern-color-fields').hidden=solid;};
+$('save-material-default').onclick=async()=>{
+  try{
+    $('save-material-default').disabled=true;
+    const id=$('swatch-material').value,colorId=$('swatch-color').value;
+    const state=await api(`/api/asset?id=${encodeURIComponent(id)}`),{token}=await api('/api/session');
+    await api(`/api/asset?id=${encodeURIComponent(id)}`,{method:'PUT',headers:{'content-type':'application/json','x-ymir-token':token},body:JSON.stringify({revision:state.revision,defaultColorId:colorId})});
+    library.catalog=await api('/ymir/catalog.json');libraries.clear();list();
+    await select(library.catalog.assets.find(a=>a.id===currentEntry.id),{previewMaterial:id,previewColor:''});
+    $('material-default-status').textContent='Material default Color saved.';
+  }catch(e){
+    $('material-default-status').textContent=e.message;
+  }finally{
+    $('save-material-default').disabled=false;
+  }
+};
+
+// New Color dialog
+$('new-color').onclick=()=>{
+  const palette=library.catalog.assets.filter(a=>a.type==='color'&&a.parameters.pattern===-1).sort((a,b)=>a.name.localeCompare(b.name));
+  for(const id of ['color-primary','color-secondary'])$(id).replaceChildren(...palette.map(c=>new Option(c.name,c.id)));
+  $('color-name').value='';$('color-error').textContent='';$('color-dialog').showModal();
+};
+$('color-generator').onchange=()=>{
+  const solid=$('color-generator').value==='solid';
+  $('solid-color-field').hidden=!solid;
+  $('pattern-color-fields').hidden=solid;
+};
 $('cancel-color').onclick=()=>$('color-dialog').close();
-$('color-form').onsubmit=async e=>{e.preventDefault();$('save-color').disabled=true;try{
-  const {token}=await api('/api/session');const generator=$('color-generator').value;
-  const result=await api('/api/colors',{method:'POST',headers:{'content-type':'application/json','x-ymir-token':token},body:JSON.stringify({metadata:{name:$('color-name').value,description:'',tags:[]},generator,...(generator==='solid'?{hex:$('color-hex').value}:{primaryColorId:$('color-primary').value,secondaryColorId:$('color-secondary').value,scale:Number($('color-repeat').value)})})});
-  $('type').value='color';await refresh(result.id);$('color-dialog').close();
-}catch(error){$('color-error').textContent=error.message;}finally{$('save-color').disabled=false;}};
+$('color-form').onsubmit=async e=>{
+  e.preventDefault();
+  $('save-color').disabled=true;
+  try{
+    const {token}=await api('/api/session');
+    const generator=$('color-generator').value;
+    const result=await api('/api/colors',{
+      method:'POST',
+      headers:{'content-type':'application/json','x-ymir-token':token},
+      body:JSON.stringify({
+        metadata:{name:$('color-name').value,description:'',tags:[]},
+        generator,
+        ...(generator==='solid'?{hex:$('color-hex').value}:{primaryColorId:$('color-primary').value,secondaryColorId:$('color-secondary').value,scale:Number($('color-repeat').value)})
+      })
+    });
+    $('type').value='color';
+    await refresh(result.id);
+    $('color-dialog').close();
+  }catch(error){
+    $('color-error').textContent=error.message;
+  }finally{
+    $('save-color').disabled=false;
+  }
+};
+
+// Rendering & Camera View
+const preview=$('preview');
+function resizeCanvas(){
+  const section=$('viewport-section');
+  if(!section)return;
+  const rect=section.getBoundingClientRect();
+  const dpr=window.devicePixelRatio||1;
+  const w=Math.round(rect.width*dpr);
+  const h=Math.round(rect.height*dpr);
+  if(preview.width!==w||preview.height!==h){
+    preview.width=w;
+    preview.height=h;
+    dirty=true;
+  }
+}
+const resizeObserver=new ResizeObserver(resizeCanvas);
+resizeObserver.observe($('viewport-section'));
+
 function draw(){
   if(!renderer)return;
   const [lo,hi]=world.bounds,center=lo.map((v,i)=>(v+hi[i])/2),size=Math.max(...lo.map((v,i)=>hi[i]-v),.1);
-  const az=(Number($('angle').value)+turn)*Math.PI/180,elevation=(BASE_ELEVATION+tilt)*Math.PI/180,d=size*1.8*zoom;
+  const az=turn*Math.PI/180,elevation=(BASE_ELEVATION+tilt)*Math.PI/180,d=size*1.8*zoom;
   const ring=Math.cos(elevation);
-  const cam={eye:[center[0]+Math.sin(az)*ring*d,center[1]+Math.sin(elevation)*d,center[2]+Math.cos(az)*ring*d],target:center};cam.view=lookAt(cam.eye,center);
+  const cam={eye:[center[0]+Math.sin(az)*ring*d,center[1]+Math.sin(elevation)*d,center[2]+Math.cos(az)*ring*d],target:center};
+  cam.view=lookAt(cam.eye,center);
   lastCamera=cam;
-  renderer.render({t:0,world,transforms,cam,projection:perspective(50*Math.PI/180,1,.01,Math.max(100,d*4)),selectedRig:{id:0},...(previewTransition?{transition:previewTransition}:{})});
+  const aspect=(preview.clientWidth||1)/(preview.clientHeight||1);
+  renderer.render({
+    t:0,
+    world,
+    transforms,
+    cam,
+    projection:perspective(50*Math.PI/180,aspect,.01,Math.max(100,d*4)),
+    selectedRig:{id:0},
+    ...(previewTransition?{transition:previewTransition}:{})
+  });
 }
+
 function pickPart(e){
   if(!lastCamera||!['prop','model'].includes(currentEntry?.type))return;
-  const rect=$('preview').getBoundingClientRect(),side=Math.min(rect.width,rect.height);
-  const x=(e.clientX-rect.x-(rect.width-side)/2)/side*2-1,y=1-(e.clientY-rect.y-(rect.height-side)/2)/side*2;
-  if(Math.abs(x)>1||Math.abs(y)>1)return;
-  const forward=unit(sub(lastCamera.target,lastCamera.eye)),right=unit(cross(forward,[0,1,0])),up=cross(right,forward),f=Math.tan(25*Math.PI/180);
-  const ray=unit(forward.map((v,i)=>v+right[i]*x*f+up[i]*y*f));let nearest=Infinity,hit;
-  for(const mesh of pickMeshes){const {points,indices,node}=mesh;
+  const rect=preview.getBoundingClientRect();
+  if(rect.width<=0||rect.height<=0)return;
+  const aspect=rect.width/rect.height;
+  const x=((e.clientX-rect.left)/rect.width)*2-1;
+  const y=1-((e.clientY-rect.top)/rect.height)*2;
+  const f=Math.tan(25*Math.PI/180);
+  const forward=unit(sub(lastCamera.target,lastCamera.eye));
+  const right=unit(cross(forward,[0,1,0]));
+  const up=cross(right,forward);
+  const ray=unit(forward.map((v,i)=>v+right[i]*x*f*aspect+up[i]*y*f));
+  let nearest=Infinity,hit;
+  for(const mesh of pickMeshes){
+    const {points,indices,node}=mesh;
     for(let i=0;i<indices.length;i+=3){
       const a=points[indices[i]],edge1=sub(points[indices[i+1]],a),edge2=sub(points[indices[i+2]],a),p=cross(ray,edge2),det=dot(edge1,p);
-      if(Math.abs(det)<1e-10)continue;const origin=sub(lastCamera.eye,a),u=dot(origin,p)/det;if(u<0||u>1)continue;
-      const q=cross(origin,edge1),v=dot(ray,q)/det;if(v<0||u+v>1)continue;
-      const distance=dot(edge2,q)/det;if(distance>0&&distance<nearest){nearest=distance;hit=node;}
+      if(Math.abs(det)<1e-10)continue;
+      const origin=sub(lastCamera.eye,a),u=dot(origin,p)/det;
+      if(u<0||u>1)continue;
+      const q=cross(origin,edge1),v=dot(ray,q)/det;
+      if(v<0||u+v>1)continue;
+      const distance=dot(edge2,q)/det;
+      if(distance>0&&distance<nearest){nearest=distance;hit=node;}
     }
   }
-  if(hit?.partId){$('part-select').value=hit.partId;$('slot-select').value=hit.surfaceSlot;$('highlight-slot').checked=true;loadSlot();}
+  if(hit?.partId&&hit?.surfaceSlot){
+    onPartSelected(hit.surfaceSlot,hit.partId);
+  }
 }
+
 function list(){
   const q=$('search').value.toLowerCase(),type=$('type').value;
   const matches=a=>`${a.name} ${a.id} ${a.description??''} ${(a.tags??[]).join(' ')} ${(a.variants??[]).map(v=>`${v.name} ${v.description??''} ${(v.tags??[]).join(' ')}`).join(' ')}`.toLowerCase().includes(q);
   const members=model=>library.catalog.assets.filter(a=>a.type==='prop'&&a.modelId===model.id);
   const entries=library.catalog.assets.filter(a=>type==='prop'?a.type==='model'&&members(a).length&&(matches(a)||members(a).some(matches)):(type==='all'||a.type===type)&&matches(a)).sort((a,b)=>a.name.localeCompare(b.name));
   $('list').replaceChildren();$('count').textContent=`${entries.length} ${type==='prop'?'model families':'resources'}`;
-  for(const entry of entries){const b=document.createElement('button');b.className='asset';b.dataset.id=entry.id;b.setAttribute('aria-pressed','false');b.textContent=entry.name;
-    const small=document.createElement('small');small.textContent=type==='prop'?`${members(entry).length} prop(s) · shared model`:`${entry.textureType??entry.type}${entry.variants?` · ${entry.variants.length} variants`:''} · ${entry.id}`;b.append(small);b.onclick=()=>select(type==='prop'?(members(entry).find(matches)??members(entry)[0]):entry);$('list').append(b);}
+  for(const entry of entries){
+    const b=document.createElement('button');
+    b.className='asset';
+    b.dataset.id=entry.id;
+    b.setAttribute('aria-pressed','false');
+    b.textContent=entry.name;
+    const small=document.createElement('small');
+    small.textContent=type==='prop'?`${members(entry).length} prop(s) · shared model`:`${entry.textureType??entry.type}${entry.variants?` · ${entry.variants.length} variants`:''} · ${entry.id}`;
+    b.append(small);
+    b.onclick=()=>{
+      const targetEntry=type==='prop'?(members(entry).find(matches)??members(entry)[0]):entry;
+      if(targetEntry.id===currentEntry?.id)return;
+      requestSwitch(()=>select(targetEntry));
+    };
+    $('list').append(b);
+  }
 }
-$('prop').onchange=()=>select(library.catalog.assets.find(a=>a.id===$('prop').value));
-$('variant').onchange=()=>select(currentEntry,{variant:$('variant').value});
-async function api(url,options={}){const r=await fetch(url,{cache:'no-store',...options});const data=await r.json();if(!r.ok)throw new Error(data.error??`Request failed (${r.status})`);return data;}
-function editFields(){const v=editState.variants.find(v=>v.id===$('edit-target').value)??editTargetState.metadata;$('edit-name').value=v.name;$('edit-description').value=v.description;$('edit-tags').value=v.tags.join(', ');}
-function metadataLoading(on){for(const id of ['edit-name','edit-description','edit-tags','save-edit'])$(id).disabled=on;}
-$('edit').onclick=async()=>{try{
-  editState=await api(`/api/asset?id=${encodeURIComponent(currentEntry.id)}`);
-  editTargetState=editState;
-  const target=$('edit-target');target.replaceChildren(new Option(`${currentEntry.type} metadata`,''));
-  if(currentEntry.modelId)target.append(new Option('Shared model metadata','model'));
-  for(const v of editState.variants)target.append(new Option(`Variant: ${v.name}`,v.id));
-  target.value='';editFields();metadataLoading(false);$('edit-error').textContent='';$('editor').showModal();
-}catch(e){$('error').textContent=e.message;}};
-$('edit-target').onchange=async()=>{const selected=$('edit-target').value;metadataLoading(true);try{const state=selected==='model'?await api(`/api/asset?id=${encodeURIComponent(currentEntry.modelId)}`):editState;if($('edit-target').value!==selected)return;editTargetState=state;editFields();}catch(e){$('edit-error').textContent=e.message;}finally{if($('edit-target').value===selected)metadataLoading(false);}};$('cancel-edit').onclick=()=>$('editor').close();
+
+async function api(url,options={}){
+  const r=await fetch(url,{cache:'no-store',...options});
+  const data=await r.json();
+  if(!r.ok)throw new Error(data.error??`Request failed (${r.status})`);
+  return data;
+}
+
+function editFields(){
+  const v=editState.variants.find(v=>v.id===$('edit-target').value)??editTargetState.metadata;
+  $('edit-name').value=v.name;
+  $('edit-description').value=v.description;
+  $('edit-tags').value=v.tags.join(', ');
+}
+function metadataLoading(on){
+  for(const id of ['edit-name','edit-description','edit-tags','save-edit'])$(id).disabled=on;
+}
+$('edit').onclick=async()=>{
+  try{
+    editState=await api(`/api/asset?id=${encodeURIComponent(currentEntry.id)}`);
+    editTargetState=editState;
+    const target=$('edit-target');
+    target.replaceChildren(new Option(`${currentEntry.type} metadata`,''));
+    if(currentEntry.modelId)target.append(new Option('Shared model metadata','model'));
+    for(const v of editState.variants)target.append(new Option(`Variant: ${v.name}`,v.id));
+    target.value='';
+    editFields();
+    metadataLoading(false);
+    $('edit-error').textContent='';
+    $('editor').showModal();
+  }catch(e){
+    $('error').textContent=e.message;
+  }
+};
+$('edit-target').onchange=async()=>{
+  const selected=$('edit-target').value;
+  metadataLoading(true);
+  try{
+    const state=selected==='model'?await api(`/api/asset?id=${encodeURIComponent(currentEntry.modelId)}`):editState;
+    if($('edit-target').value!==selected)return;
+    editTargetState=state;
+    editFields();
+  }catch(e){
+    $('edit-error').textContent=e.message;
+  }finally{
+    if($('edit-target').value===selected)metadataLoading(false);
+  }
+};
+$('cancel-edit').onclick=()=>$('editor').close();
+
 async function refresh(id){
-  library.catalog=await api('/ymir/catalog.json');libraries.clear();list();
+  library.catalog=await api('/ymir/catalog.json');
+  libraries.clear();
+  list();
   const entry=library.catalog.assets.find(a=>a.id===id)??library.catalog.assets.find(a=>a.type==='prop')??library.catalog.assets[0];
   if(entry)await select(entry,{variant:entry.variants?.some(v=>v.id===currentVariant)?currentVariant:entry.defaultVariant});
-  else{++generation;renderer?.dispose();renderer=null;currentEntry=null;$('title').textContent='No assets';$('details').textContent='';$('edit').disabled=$('delete').disabled=true;$('variant-control').hidden=$('prop-control').hidden=true;$('model-info').textContent='';}
+  else{
+    ++generation;
+    renderer?.dispose();
+    renderer=null;
+    currentEntry=null;
+    $('title').textContent='No assets';
+    $('edit').disabled=$('delete').disabled=true;
+    if($('variant-control'))$('variant-control').hidden=true;
+  }
 }
+
 async function saveEdit(){
   $('edit-error').textContent='';
   const target=$('edit-target').value,variantId=target==='model'?'':target;
-  if(target==='model'&&editTargetState.entry.id!==currentEntry.modelId){$('edit-error').textContent='Model metadata is still loading. Try again.';return;}
+  if(target==='model'&&editTargetState.entry.id!==currentEntry.modelId){
+    $('edit-error').textContent='Model metadata is still loading. Try again.';
+    return;
+  }
   $('save-edit').disabled=true;
   try{
     const {token}=await api('/api/session');
-    await api(`/api/asset?id=${encodeURIComponent(editTargetState.entry.id)}`,{method:'PUT',headers:{'content-type':'application/json','x-ymir-token':token},body:JSON.stringify({revision:editTargetState.revision,variantId:variantId||undefined,metadata:{name:$('edit-name').value,description:$('edit-description').value,tags:$('edit-tags').value.split(',').map(t=>t.trim()).filter(Boolean)}})});
-    const id=currentEntry.id;await refresh(id);$('editor').close();
-  }catch(e){$('edit-error').textContent=e.message;}finally{$('save-edit').disabled=false;}
+    await api(`/api/asset?id=${encodeURIComponent(editTargetState.entry.id)}`,{
+      method:'PUT',
+      headers:{'content-type':'application/json','x-ymir-token':token},
+      body:JSON.stringify({
+        revision:editTargetState.revision,
+        variantId:variantId||undefined,
+        metadata:{
+          name:$('edit-name').value,
+          description:$('edit-description').value,
+          tags:$('edit-tags').value.split(',').map(t=>t.trim()).filter(Boolean)
+        }
+      })
+    });
+    const id=currentEntry.id;
+    await refresh(id);
+    $('editor').close();
+  }catch(e){
+    $('edit-error').textContent=e.message;
+  }finally{
+    $('save-edit').disabled=false;
+  }
 }
 $('edit-form').onsubmit=e=>{e.preventDefault();saveEdit();};
-$('delete').onclick=async()=>{try{
-  deleteState=await api(`/api/asset?id=${encodeURIComponent(currentEntry.id)}`);
-  const model=currentEntry.modelId?await api(`/api/asset?id=${encodeURIComponent(currentEntry.modelId)}`):currentEntry.type==='model'?deleteState:null;
-  deleteState.model=model;
-  $('delete-context').textContent=`Selected: ${currentEntry.name}${currentVariant?' · '+(currentEntry.variants.find(v=>v.id===currentVariant)?.name??currentVariant):''}`;
-  $('delete-choices').replaceChildren();
-  const choices=currentEntry.type==='prop'?[
-    {scope:'variant',name:'Delete selected variant',tip:'Removes only this appearance. The prop, shared model and other variants stay. The last variant cannot be deleted separately.',disabled:deleteState.variants.length<2},
-    {scope:'prop',name:'Delete this prop',tip:'Removes this prop and all its appearance variants. The shared model and other props stay.'},
-    {scope:'model',name:'Delete shared model',tip:`Removes the geometry resource, not any props. Blocked while ${model.dependents.length} prop(s) use it; delete those props first.`,disabled:model.dependents.length>0}
-  ]:[{scope:currentEntry.type,name:`Delete this ${currentEntry.type}`,tip:currentEntry.type==='model'?`Removes the geometry resource. Blocked while ${model.dependents.length} prop(s) use it; no cascading deletion.`:'Removes this resource from the shared library. In-use Materials and Colors are protected.',disabled:currentEntry.type==='model'&&model.dependents.length>0}];
-  for(const choice of choices){const label=document.createElement('label');label.className='delete-choice';label.title=choice.tip;const radio=document.createElement('input');radio.type='radio';radio.name='scope';radio.value=choice.scope;radio.required=true;radio.disabled=!!choice.disabled;label.append(radio,document.createTextNode(choice.name));const hint=document.createElement('small');hint.textContent=choice.tip;label.append(hint);$('delete-choices').append(label);}
-  $('confirm-delete').disabled=choices.every(c=>c.disabled);$('delete-error').textContent='';$('delete-dialog').showModal();
-}catch(e){$('error').textContent=e.message;}};
-$('cancel-delete').onclick=()=>$('delete-dialog').close();
-$('delete-form').onsubmit=async e=>{e.preventDefault();const scope=new FormData(e.target).get('scope');if(!scope)return;$('confirm-delete').disabled=true;
-  try{const target=scope==='model'?deleteState.model:deleteState;const {token}=await api('/api/session');
-    await api(`/api/asset?id=${encodeURIComponent(target.entry.id)}`,{method:'DELETE',headers:{'content-type':'application/json','x-ymir-token':token},body:JSON.stringify({revision:target.revision,scope,variantId:scope==='variant'?currentVariant:undefined})});
-    await refresh(currentEntry.id);$('delete-dialog').close();
-  }catch(error){$('delete-error').textContent=error.message;}finally{$('confirm-delete').disabled=false;}
+
+$('delete').onclick=async()=>{
+  try{
+    deleteState=await api(`/api/asset?id=${encodeURIComponent(currentEntry.id)}`);
+    const model=currentEntry.modelId?await api(`/api/asset?id=${encodeURIComponent(currentEntry.modelId)}`):currentEntry.type==='model'?deleteState:null;
+    deleteState.model=model;
+    $('delete-context').textContent=`Selected: ${currentEntry.name}${currentVariant?' · '+(currentEntry.variants.find(v=>v.id===currentVariant)?.name??currentVariant):''}`;
+    $('delete-choices').replaceChildren();
+    const choices=currentEntry.type==='prop'?[
+      {scope:'variant',name:'Delete selected variant',tip:'Removes only this appearance. The prop, shared model and other variants stay. The last variant cannot be deleted separately.',disabled:deleteState.variants.length<2},
+      {scope:'prop',name:'Delete this prop',tip:'Removes this prop and all its appearance variants. The shared model and other props stay.'},
+      {scope:'model',name:'Delete shared model',tip:`Removes the geometry resource, not any props. Blocked while ${model.dependents.length} prop(s) use it; delete those props first.`,disabled:model.dependents.length>0}
+    ]:[{scope:currentEntry.type,name:`Delete this ${currentEntry.type}`,tip:currentEntry.type==='model'?`Removes the geometry resource. Blocked while ${model.dependents.length} prop(s) use it; no cascading deletion.`:'Removes this resource from the shared library. In-use Materials and Colors are protected.',disabled:currentEntry.type==='model'&&model.dependents.length>0}];
+    for(const choice of choices){
+      const label=document.createElement('label');
+      label.className='delete-choice';
+      label.title=choice.tip;
+      const radio=document.createElement('input');
+      radio.type='radio';
+      radio.name='scope';
+      radio.value=choice.scope;
+      radio.required=true;
+      radio.disabled=!!choice.disabled;
+      label.append(radio,document.createTextNode(choice.name));
+      const hint=document.createElement('small');
+      hint.textContent=choice.tip;
+      label.append(hint);
+      $('delete-choices').append(label);
+    }
+    $('confirm-delete').disabled=choices.every(c=>c.disabled);
+    $('delete-error').textContent='';
+    $('delete-dialog').showModal();
+  }catch(e){
+    $('error').textContent=e.message;
+  }
 };
-$('search').oninput=list;$('type').onchange=list;$('angle').onchange=()=>{dirty=true;};
+$('cancel-delete').onclick=()=>$('delete-dialog').close();
+$('delete-form').onsubmit=async e=>{
+  e.preventDefault();
+  const scope=new FormData(e.target).get('scope');
+  if(!scope)return;
+  $('confirm-delete').disabled=true;
+  try{
+    const target=scope==='model'?deleteState.model:deleteState;
+    const {token}=await api('/api/session');
+    await api(`/api/asset?id=${encodeURIComponent(target.entry.id)}`,{
+      method:'DELETE',
+      headers:{'content-type':'application/json','x-ymir-token':token},
+      body:JSON.stringify({
+        revision:target.revision,
+        scope,
+        variantId:scope==='variant'?currentVariant:undefined
+      })
+    });
+    await refresh(currentEntry.id);
+    $('delete-dialog').close();
+  }catch(error){
+    $('delete-error').textContent=error.message;
+  }finally{
+    $('confirm-delete').disabled=false;
+  }
+};
+
+$('search').oninput=list;
+$('type').onchange=list;
+
 if(readOnly&&!library.catalog.assets.some(a=>a.type==='prop'))$('type').value='model';
 if(readOnly)for(const id of ['new-color','delete','edit'])$(id).hidden=true;
+
 list();
-const preview=$('preview');preview.style.touchAction='none';preview.style.cursor='grab';
-preview.onpointerdown=e=>{if(e.button!==0&&e.button!==1)return;e.preventDefault();drag={id:e.pointerId,button:e.button,x:e.clientX,y:e.clientY,startX:e.clientX,startY:e.clientY};preview.setPointerCapture(e.pointerId);preview.style.cursor='grabbing';};
-preview.onpointermove=e=>{if(!drag||drag.id!==e.pointerId)return;drag.moved||=Math.hypot(e.clientX-drag.startX,e.clientY-drag.startY)>5;
-  // Orbit the camera opposite the equivalent model rotation: right is CCW around +Y;
-  // middle-drag down is CCW around +X. Primary drag retains horizontal orbit only.
-   ({turn,tilt}=applyOrbitDrag(turn,tilt,drag.button,e.clientX-drag.x,e.clientY-drag.y));
-   drag.x=e.clientX;drag.y=e.clientY;dirty=true;};
-function endDrag(e){if(drag?.id!==e.pointerId)return;const click=drag.button===0&&e.type==='pointerup'&&!drag.moved&&Math.hypot(e.clientX-drag.startX,e.clientY-drag.startY)<5;drag=null;preview.style.cursor='grab';if(preview.hasPointerCapture(e.pointerId))preview.releasePointerCapture(e.pointerId);if(click)pickPart(e);}
-preview.onpointerup=endDrag;preview.onpointercancel=endDrag;preview.onlostpointercapture=()=>{drag=null;preview.style.cursor='grab';};
+
+preview.style.touchAction='none';
+preview.style.cursor='grab';
+preview.onpointerdown=e=>{
+  if(e.button!==0&&e.button!==1)return;
+  e.preventDefault();
+  drag={id:e.pointerId,button:e.button,x:e.clientX,y:e.clientY,startX:e.clientX,startY:e.clientY};
+  preview.setPointerCapture(e.pointerId);
+  preview.style.cursor='grabbing';
+};
+preview.onpointermove=e=>{
+  if(!drag||drag.id!==e.pointerId)return;
+  drag.moved||=Math.hypot(e.clientX-drag.startX,e.clientY-drag.startY)>5;
+  ({turn,tilt}=applyOrbitDrag(turn,tilt,drag.button,e.clientX-drag.x,e.clientY-drag.y));
+  drag.x=e.clientX;
+  drag.y=e.clientY;
+  dirty=true;
+};
+function endDrag(e){
+  if(drag?.id!==e.pointerId)return;
+  const click=drag.button===0&&e.type==='pointerup'&&!drag.moved&&Math.hypot(e.clientX-drag.startX,e.clientY-drag.startY)<5;
+  drag=null;
+  preview.style.cursor='grab';
+  if(preview.hasPointerCapture(e.pointerId))preview.releasePointerCapture(e.pointerId);
+  if(click)pickPart(e);
+}
+preview.onpointerup=endDrag;
+preview.onpointercancel=endDrag;
+preview.onlostpointercapture=()=>{drag=null;preview.style.cursor='grab';};
 preview.addEventListener('auxclick',e=>{if(e.button===1)e.preventDefault();});
 preview.addEventListener('wheel',e=>{
   if(!renderer)return;
@@ -256,16 +710,32 @@ preview.addEventListener('wheel',e=>{
   zoom=Math.max(.35,Math.min(4,zoom*Math.exp(Math.max(-1000,Math.min(1000,pixels))*.0015)));
   dirty=true;
 },{passive:false});
-// Interactive preview only: cap at 24fps, pause when hidden, and draw static views on demand.
+
 let previous=0,lastDraw=0;
 function animate(t){
-  const spinning=$('spin').checked&&!drag&&!document.hidden;
-  if(spinning&&renderer){turn+=(previous?Math.min(t-previous,100):0)*.025;dirty=true;}
+  const spinning=turntableOn&&!drag&&!document.hidden;
+  if(spinning&&renderer){
+    turn+=(previous?Math.min(t-previous,100):0)*.025;
+    dirty=true;
+  }
   previous=t;
   if(dirty&&renderer&&!document.hidden&&t-lastDraw>=1000/24){
-    try{draw();dirty=false;lastDraw=t;}catch(e){$('spin').checked=false;dirty=false;$('error').textContent=e.message;}
+    try{
+      draw();
+      dirty=false;
+      lastDraw=t;
+    }catch(e){
+      turntableOn=false;
+      $('turntable-btn').setAttribute('aria-pressed','false');
+      $('turntable-btn').classList.remove('active');
+      dirty=false;
+      $('error').textContent=e.message;
+    }
   }
   requestAnimationFrame(animate);
-}requestAnimationFrame(animate);
+}
+requestAnimationFrame(animate);
+
 await select(library.catalog.assets.find(a=>a.id==='grwm/hatc-gold-clip-dc7c5a60a1@3')??(readOnly?library.catalog.assets.find(a=>a.type==='prop')??library.catalog.assets[0]:library.catalog.assets.find(a=>a.sourceVersion==='v4'&&/mirror/i.test(a.name))??library.catalog.assets[0]));
+
 window.__ymir={get catalog(){return library.catalog;},select,draw,get rotation(){return turn;},get tilt(){return tilt;},get zoom(){return zoom;}};

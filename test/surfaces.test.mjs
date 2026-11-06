@@ -45,5 +45,21 @@ test('surface assignments reference named Colors; palette/pattern creation and n
     assert.equal((await send('/api/asset?id=prop','PUT',bulk)).status,200);
     saved=JSON.parse(await readFile(root+'/prop.json','utf8'));const both=saved.variants.find(v=>v.name==='Both Surfaces');
     assert.equal(both.slots.length,2);assert.ok(both.slots.every(s=>s.material.id==='cotton'&&s.color.id==='white'));assert.deepEqual(saved.parts,prop.parts);
+    // One atomic request can give different slots different Materials and Colors.
+    state=await get('prop');const beforeMulti=await readFile(root+'/prop.json','utf8'),beforeMultiSlots=state.slots;
+    const multi={revision:state.revision,variantId:'original',appearance:{target:'new-variant',newVariantName:'Split Surfaces',assignments:[
+      {slotId:'case',materialId:'cotton',colorId:'white'},
+      {slotId:'trim',materialId:'silk',colorId:''}
+    ]}};
+    const withAssignments=assignments=>({...multi,appearance:{...multi.appearance,assignments}});
+    assert.equal((await send('/api/asset?id=prop','PUT',withAssignments([{slotId:'case',materialId:'cotton',colorId:'white'},{slotId:'trim',materialId:'silk',colorId:'missing'}]))).status,400);
+    assert.equal((await send('/api/asset?id=prop','PUT',withAssignments([{slotId:'case',materialId:'missing',colorId:'white'},{slotId:'trim',materialId:'silk',colorId:''}]))).status,400);
+    assert.equal((await send('/api/asset?id=prop','PUT',withAssignments([{slotId:'case',materialId:'cotton',colorId:'white'},{slotId:'case',materialId:'silk',colorId:''}]))).status,400);
+    assert.equal(await readFile(root+'/prop.json','utf8'),beforeMulti);
+    const multiResult=await send('/api/asset?id=prop','PUT',multi);assert.equal(multiResult.status,200);const multiId=(await multiResult.json()).variantId;
+    saved=JSON.parse(await readFile(root+'/prop.json','utf8'));const split=saved.variants.find(v=>v.id===multiId);
+    assert.equal(split.name,'Split Surfaces');
+    assert.deepEqual(split.slots,[{slotId:'case',material:{id:'cotton'},color:{id:'white'}},{slotId:'trim',material:{id:'silk'}}]);
+    assert.deepEqual(saved.slots,beforeMultiSlots);assert.deepEqual(saved.parts,prop.parts);
   }finally{await new Promise(r=>server.close(r));await rm(root,{recursive:true});}
 });

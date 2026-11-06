@@ -78,12 +78,33 @@ export function createEditor(root){
           }
           if(input.appearance){
             const change=input.appearance;
-            if(asset.type!=='prop'||asset.schemaVersion!==3||Object.keys(change).some(k=>!['slotId','slotIds','materialId','colorId','target','newVariantName'].includes(k)))throw Object.assign(new Error('Invalid surface assignment'),{status:400});
+            if(asset.type!=='prop'||asset.schemaVersion!==3||Object.keys(change).some(k=>!['slotId','slotIds','materialId','colorId','target','newVariantName','assignments'].includes(k)))throw Object.assign(new Error('Invalid surface assignment'),{status:400});
             const model=await json(await safe(asset.model));
-            const bulk=Object.hasOwn(change,'slotIds'),slotIds=bulk?change.slotIds:[change.slotId];
-            if(bulk&&Object.hasOwn(change,'slotId')||!Array.isArray(slotIds)||!slotIds.length||new Set(slotIds).size!==slotIds.length||slotIds.some(id=>!model.slots.some(s=>s.id===id)))throw Object.assign(new Error('Choose valid unique model surface slots'),{status:400});
-            const material=catalog.assets.find(a=>a.type==='material'&&a.id===change.materialId),color=catalog.assets.find(a=>a.type==='color'&&a.id===change.colorId);
-            if(!material||change.colorId!==''&&!color||material.suiteManifest!==asset.suiteManifest||change.colorId===''&&!catalog.assets.some(a=>a.type==='color'&&a.id===material.defaultColorId))throw Object.assign(new Error('Choose an existing compatible Material and named Color resource, or its default Color'),{status:400});
+            const modelSlots=new Set(model.slots.map(s=>s.id));
+            const resolveSurface=(materialId,colorId)=>{
+              if(typeof materialId!=='string'||typeof colorId!=='string')throw Object.assign(new Error('Each surface assignment needs a Material and a named Color resource, or its default Color'),{status:400});
+              const material=catalog.assets.find(a=>a.type==='material'&&a.id===materialId),color=catalog.assets.find(a=>a.type==='color'&&a.id===colorId);
+              if(!material||colorId!==''&&!color||material.suiteManifest!==asset.suiteManifest||colorId===''&&!catalog.assets.some(a=>a.type==='color'&&a.id===material.defaultColorId))throw Object.assign(new Error('Choose an existing compatible Material and named Color resource, or its default Color'),{status:400});
+              return {material,color};
+            };
+            let groups;
+            if(Object.hasOwn(change,'assignments')){
+              // Atomic multi-surface request: every entry is validated before the asset is touched.
+              if(['slotId','slotIds','materialId','colorId'].some(k=>Object.hasOwn(change,k)))throw Object.assign(new Error('Send assignments instead of slotId, slotIds, materialId and colorId'),{status:400});
+              if(!Array.isArray(change.assignments)||!change.assignments.length)throw Object.assign(new Error('Provide at least one surface assignment'),{status:400});
+              const seen=new Set();
+              groups=change.assignments.map(assignment=>{
+                if(!assignment||typeof assignment!=='object'||Array.isArray(assignment)||Object.keys(assignment).some(k=>!['slotId','slotIds','materialId','colorId'].includes(k)))throw Object.assign(new Error('Invalid surface assignment entry'),{status:400});
+                const bulk=Object.hasOwn(assignment,'slotIds'),slotIds=bulk?assignment.slotIds:[assignment.slotId];
+                if(bulk&&Object.hasOwn(assignment,'slotId')||!Array.isArray(slotIds)||!slotIds.length||new Set(slotIds).size!==slotIds.length||slotIds.some(id=>typeof id!=='string'||!modelSlots.has(id)))throw Object.assign(new Error('Choose valid unique model surface slots'),{status:400});
+                for(const slotId of slotIds){if(seen.has(slotId))throw Object.assign(new Error('Each model surface slot can be assigned once per request'),{status:400});seen.add(slotId);}
+                return {slotIds:[...slotIds],...resolveSurface(assignment.materialId,assignment.colorId)};
+              });
+            }else{
+              const bulk=Object.hasOwn(change,'slotIds'),slotIds=bulk?change.slotIds:[change.slotId];
+              if(bulk&&Object.hasOwn(change,'slotId')||!Array.isArray(slotIds)||!slotIds.length||new Set(slotIds).size!==slotIds.length||slotIds.some(id=>!modelSlots.has(id)))throw Object.assign(new Error('Choose valid unique model surface slots'),{status:400});
+              groups=[{slotIds:[...slotIds],...resolveSurface(change.materialId,change.colorId)}];
+            }
             if(!['prop','variant','new-variant'].includes(change.target))throw Object.assign(new Error('Choose prop defaults, this variant, or a new variant'),{status:400});
             let destination=asset;
             if(change.target==='variant'){if(!variant)throw Object.assign(new Error('Variant required'),{status:400});destination=variant;}
@@ -91,11 +112,12 @@ export function createEditor(root){
               if(!variant||typeof change.newVariantName!=='string'||!change.newVariantName.trim()||change.newVariantName.length>120)throw Object.assign(new Error('Name the new variant (1–120 characters)'),{status:400});
               destination=structuredClone(variant);destination.id='variant-'+randomBytes(6).toString('hex');destination.name=change.newVariantName.trim();delete destination.sourceAssetId;asset.variants.push(destination);
             }
-            const assignments=slotIds.map(slotId=>{
+            const assignments=groups.flatMap(({slotIds,material,color})=>slotIds.map(slotId=>{
               const old=[...asset.slots,...(change.target==='prop'?[]:variant?.slots??[])].findLast(s=>s.slotId===slotId);
               // Keep each slot's own roughness/metal overrides when retaining its Material.
               return {slotId,material:old?.material.id===material.id?old.material:{id:material.id},...(color?{color:{id:color.id}}:{})};
-            });
+            }));
+            const slotIds=assignments.map(a=>a.slotId);
             destination.slots=[...(destination.slots??[]).filter(s=>!slotIds.includes(s.slotId)),...assignments];
             entry.variants=asset.variants.map(({overrides,bindings,slots,partMetadata,...v})=>v);
             await atomic(file,asset);await atomic(path.join(root,'catalog.json'),catalog);

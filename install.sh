@@ -143,6 +143,24 @@ echo "--> Installing Node.js dependencies (Trinity renderer)..."
   fi
 )
 
+# 4a. Prefer the locally built Trinity release when this workspace checkout is
+# installed. The package URL remains the portable fallback for standalone Ymir
+# checkouts that do not have the sibling Trinity source tree.
+TRINITY_SOURCE_DIR="${SOURCE_DIR}/../trinity"
+if [[ -f "${TRINITY_SOURCE_DIR}/package.json" ]] && node -e 'process.exit(require(process.argv[1]).name==="trinity"?0:1)' "${TRINITY_SOURCE_DIR}/package.json"; then
+  TRINITY_VERSION="$(node -p 'require(process.argv[1]).version' "${TRINITY_SOURCE_DIR}/package.json")"
+  TRINITY_BUNDLE="${TRINITY_SOURCE_DIR}/dist/trinity-${TRINITY_VERSION}.mjs"
+  if [[ -f "${TRINITY_BUNDLE}" ]]; then
+    echo "--> Installing the workspace-built Trinity ${TRINITY_VERSION} renderer..."
+    cp "${TRINITY_SOURCE_DIR}/package.json" "${LIB_DIR}/node_modules/trinity/package.json"
+    mkdir -p "${LIB_DIR}/node_modules/trinity/dist"
+    cp "${TRINITY_BUNDLE}" "${LIB_DIR}/node_modules/trinity/dist/"
+    if [[ -f "${TRINITY_SOURCE_DIR}/dist/SHA256SUMS" ]]; then
+      cp "${TRINITY_SOURCE_DIR}/dist/SHA256SUMS" "${LIB_DIR}/node_modules/trinity/dist/"
+    fi
+  fi
+fi
+
 # 5. Set up Python virtual environment for tray dependencies (pystray, Pillow, system GTK3)
 echo "--> Setting up Python environment for system tray integration..."
 VENV_DIR="${LIB_DIR}/.venv"
@@ -162,12 +180,20 @@ if [[ "$INSTALL_LIBRARY" == "true" ]]; then
     echo "--> Existing catalog found at ${DATA_DIR}; keeping existing library intact."
   else
     echo "--> Installing initial asset library to ${DATA_DIR}..."
-    for item in catalog.json models props materials colors effects textures generators; do
+    for item in catalog.json models props textures generators; do
       if [[ -e "${SOURCE_DIR}/${item}" ]]; then
         cp -r "${SOURCE_DIR}/${item}" "${DATA_DIR}/"
       fi
     done
   fi
+  # Keep live shader suites and their referenced effects/color generators in
+  # sync even when an existing catalog and user library are being preserved.
+  for item in materials colors effects; do
+    if [[ -d "${SOURCE_DIR}/${item}" ]]; then
+      mkdir -p "${DATA_DIR}/${item}"
+      cp -r "${SOURCE_DIR}/${item}/." "${DATA_DIR}/${item}/"
+    fi
+  done
 fi
 
 # 7. Generate application icon

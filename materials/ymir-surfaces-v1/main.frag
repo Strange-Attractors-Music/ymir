@@ -17,6 +17,7 @@ uniform sampler2D shadow_map_a,shadow_map_b;
 uniform mat4 light_matrix_a,light_matrix_b;
 uniform samplerCube environment_map;
 uniform float environment_pass,environment_ready;
+uniform float studio_environment;
 uniform float linear_capture;
 uniform vec3 environment_position;
 uniform int contact_count;
@@ -120,6 +121,13 @@ vec3 directBRDF(vec3 n,vec3 v,vec3 l,vec3 base,float rough,float metal,vec3 tang
 }
 vec3 sceneEnvironment(vec3 direction,float rough){
     if(environment_ready<.5||environment_pass>.5)return roughRoom(direction,rough)*.06;
+    // Asset inspection uses an unbounded studio dome. Sampling the probe by
+    // direction avoids parallax-box corners and remains continuous on curved
+    // surfaces; the room-box projection below is reserved for GRWM scenes.
+    if(studio_environment>.5){
+        vec3 encoded=textureLod(environment_map,normalize(direction),clamp(rough,0.0,1.0)*9.0).rgb;
+        return min(encoded*.85/max(vec3(.025),vec3(1)-encoded),vec3(12.0));
+    }
     // The probe captures the actual lit table, props, curtains and star wall.
     // Its linear tone encoding preserves range in a portable RGBA8 cube map.
     vec3 safeRay=mix(vec3(.00001),direction,step(vec3(.00001),abs(direction)));
@@ -131,7 +139,7 @@ vec3 sceneEnvironment(vec3 direction,float rough){
     // Prevent self-reflection artifacts on downward-facing surfaces where the probe (positioned
     // above the stage at Y=0.55 looking down) captured the top of the object. Downward reflections
     // smoothly transition to the analytic studio floor lighting instead of mirroring the top.
-    float floorFactor=smoothstep(0.05,-0.25,direction.y);
+    float floorFactor=1.0-smoothstep(-0.25,0.05,direction.y);
     vec3 floorColor=roughRoom(direction,rough)*0.35;
     return mix(probeColor,floorColor,floorFactor);
 }

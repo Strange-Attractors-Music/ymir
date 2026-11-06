@@ -1,6 +1,6 @@
-// An analytic, world-anchored star wall BEHIND the shooting camera, with side
-// returns for angled mirrors. It is drawn only in the real reflection camera.
-// Reflected props occlude it normally; this is not a decal over the mirror.
+// GRWM mirrors use the world-anchored star wall and side returns. Asset
+// inspection opts into the seamless studio dome instead, for both probes and
+// planar mirror views. The GRWM environment remains the default.
 export function createMirrorEnvironment(gl){
   const compile=(type,source)=>{const s=gl.createShader(type);gl.shaderSource(s,source);gl.compileShader(s);if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))throw new Error(gl.getShaderInfoLog(s));return s;};
   const vertex=compile(gl.VERTEX_SHADER,`#version 300 es
@@ -8,7 +8,7 @@ export function createMirrorEnvironment(gl){
   const fragment=compile(gl.FRAGMENT_SHADER,`#version 300 es
   precision highp float;in vec2 uv;out vec4 frag;
   uniform vec3 eye,target,camera_up;uniform float stage_z,energy;
-  uniform float probe_pass,linear_background;uniform vec3 key_position,light_a,light_b,color_a,color_b;uniform vec3 light_energy;
+  uniform float probe_pass,linear_background,studio_pass;uniform vec3 key_position,light_a,light_b,color_a,color_b;uniform vec3 light_energy;
   float hash(vec2 p){return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453);}
   float noise(vec2 p){vec2 i=floor(p),f=fract(p);f=f*f*(3.-2.*f);return mix(mix(hash(i),hash(i+vec2(1,0)),f.x),mix(hash(i+vec2(0,1)),hash(i+vec2(1)),f.x),f.y);}
   vec3 stars(vec2 p,float density){
@@ -25,8 +25,32 @@ export function createMirrorEnvironment(gl){
     }
     return color;
   }
+  vec3 studio(vec3 ray){
+    // A seamless directional studio dome: broad softboxes and a restrained
+    // floor/ceiling gradient, with no finite walls or geometric room edges.
+    vec3 c=mix(vec3(.025,.030,.040),vec3(.19,.17,.15),smoothstep(-.48,.28,ray.y));
+    float vertical=exp(-((ray.x+.20)*(ray.x+.20)+(ray.y-.12)*(ray.y-.12)*.08)*18.0);
+    float edge=exp(-((ray.x-.63)*(ray.x-.63)*4.5+(ray.y-.15)*(ray.y-.15)*.12)*16.0);
+    float top=pow(max(0.0,dot(ray,normalize(vec3(-.3,.86,.30)))),24.0);
+    c+=vec3(1.05,.97,.85)*vertical;
+    c+=vec3(.72,.80,.92)*edge;
+    c+=vec3(.56,.48,.38)*top;
+    float key=exp(-(1.0-dot(ray,normalize(key_position-eye)))/.045);
+    float a=exp(-(1.0-dot(ray,normalize(light_a-eye)))/.035);
+    float b=exp(-(1.0-dot(ray,normalize(light_b-eye)))/.035);
+    c+=vec3(1.0,.93,.81)*key*light_energy.x*1.8;
+    c+=color_a*a*light_energy.y*1.4+color_b*b*light_energy.z*1.4;
+    return c*(.88+.12*energy);
+  }
   void main(){
     vec3 f=normalize(target-eye),right=normalize(cross(f,camera_up)),up=cross(right,f);
+    if(studio_pass>.5){
+      float aspect=probe_pass>.5?1.:.5625,tanFov=probe_pass>.5?1.:.46630766;
+      vec3 ray=normalize(f+right*(uv.x*2.-1.)*aspect*tanFov+up*(uv.y*2.-1.)*tanFov);
+      vec3 c=studio(ray);
+      frag=vec4(probe_pass>.5||linear_background>.5?c/(c+vec3(.85)):clamp(c,0.0,1.0),1.0);
+      return;
+    }
     float aspect=probe_pass>.5?1.:.5625,tanFov=probe_pass>.5?1.:.46630766;
     vec3 ray=normalize(f+right*(uv.x*2.-1.)*aspect*tanFov+up*(uv.y*2.-1.)*tanFov);
     float distance=1e5;int wall=0;
@@ -58,6 +82,7 @@ export function createMirrorEnvironment(gl){
     gl.uniform1f(loc('stage_z'),stageZ);gl.uniform1f(loc('energy'),energy);
     gl.uniform1f(loc('probe_pass'),options.probe?1:0);
     gl.uniform1f(loc('linear_background'),options.linear?1:0);
+    gl.uniform1f(loc('studio_pass'),options.studio?1:0);
     const show=options.show??{};
     for(const [name,value] of [['key_position',options.light??[-4,8,stageZ+6]],['light_a',[-2.9,4.9,stageZ-2.5]],['light_b',[2.9,4.9,stageZ-2.8]],['color_a',show.colorA??[1,1,1]],['color_b',show.colorB??[1,1,1]],['light_energy',[show.keyGain??1,show.beams?.[0]?.energy??0,show.beams?.[1]?.energy??0]]])gl.uniform3fv(loc(name),value);
     gl.drawArrays(gl.TRIANGLES,0,3);

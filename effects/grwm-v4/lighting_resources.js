@@ -11,7 +11,8 @@ export function createLightingResources(gl){
   };
   const cube=size=>{
     const texture=gl.createTexture();gl.bindTexture(gl.TEXTURE_CUBE_MAP,texture);
-    for(let i=0;i<6;i++)gl.texImage2D(gl.TEXTURE_CUBE_MAP_POSITIVE_X+i,0,gl.RGBA8,size,size,0,gl.RGBA,gl.UNSIGNED_BYTE,null);
+    const empty=new Uint8Array(size*size*4);
+    for(let i=0;i<6;i++)gl.texImage2D(gl.TEXTURE_CUBE_MAP_POSITIVE_X+i,0,gl.RGBA8,size,size,0,gl.RGBA,gl.UNSIGNED_BYTE,empty);
     for(const key of [gl.TEXTURE_WRAP_S,gl.TEXTURE_WRAP_T,gl.TEXTURE_WRAP_R])gl.texParameteri(gl.TEXTURE_CUBE_MAP,key,gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_CUBE_MAP,gl.TEXTURE_MIN_FILTER,size===1?gl.LINEAR:gl.LINEAR_MIPMAP_LINEAR);gl.texParameteri(gl.TEXTURE_CUBE_MAP,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
     if(size>1)gl.generateMipmap(gl.TEXTURE_CUBE_MAP);return texture;

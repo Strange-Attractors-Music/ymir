@@ -63,6 +63,21 @@ function swatch(material,color){
     ...material.parameters,color:color.parameters.primary,colorData:color.parameters,kind:material.profile,pos:[0,0,0],rot:[0,0,0],scale:[1,1,1],assembly:0,deformability:0,label:'material swatch',surface_center:[0,0,0],surface_normal:[0,0,1]}]};
 }
 
+// Compute high-performance, crisp canvas resolution capped to prevent GPU lag
+function getTargetResolution(){
+  const section=$('viewport-section');
+  const rect=section?section.getBoundingClientRect():{width:960,height:720};
+  const dpr=Math.min(window.devicePixelRatio||1,1.25); // Cap DPR at 1.25 for 60fps on all GPUs
+  const rawW=Math.max(320,Math.round(rect.width*dpr));
+  const rawH=Math.max(240,Math.round(rect.height*dpr));
+  const maxDim=1280;
+  const scale=Math.min(1,maxDim/Math.max(rawW,rawH));
+  return {
+    width:Math.round(rawW*scale),
+    height:Math.round(rawH*scale)
+  };
+}
+
 async function select(entry,{variant=entry.defaultVariant,previewMaterial,previewColor}={}){
   const preserveView=currentEntry?.id===entry.id;
   previewTransition=null;
@@ -112,13 +127,16 @@ async function select(entry,{variant=entry.defaultVariant,previewMaterial,previe
     if(entry.preview==='backdrop')world.nodes=[];
     const transition={meshData:prop.raw,vertex_offset:0,...prop.nodes[0]};
 
-    // Ensure canvas size is accurate prior to creating WebGL framebuffers and viewport
-    resizeCanvas();
+    // Calculate optimal high-performance canvas buffer dimensions
+    const res=getTargetResolution();
+    const previewEl=$('preview');
+    previewEl.width=res.width;
+    previewEl.height=res.height;
 
     const candidate=await createRenderer({
-      canvas:$('preview'),
-      width:preview.width,
-      height:preview.height,
+      canvas:previewEl,
+      width:res.width,
+      height:res.height,
       book:{worlds:[{...world,meshData:prop.raw}],transition},
       shaders:selectedLibrary.shaders,
       quality:{shadowSize:2048,cacheEnvironment:true,synchronize:false}
@@ -252,7 +270,7 @@ function highlightSelected(){
 }
 
 function onPartSelected(slotId,partId){
-  if(readOnly)return;
+  // Part selection works on both local and GitHub Pages read-only mode
   selectedSlot=slotId;
   selectedPart=partId;
   highlightSelected();
@@ -329,7 +347,8 @@ function updateLiveNodes(){
 
 function updateSaveCheckVisibility(){
   const btn=$('save-check-btn');
-  if(btn)btn.hidden=(stagedChanges.size===0);
+  // Hide save button on read-only deployments, but keep live preview and card functional
+  if(btn)btn.hidden=readOnly||(stagedChanges.size===0);
 }
 
 // Turntable toggle button
@@ -504,22 +523,6 @@ $('color-form').onsubmit=async e=>{
 
 // Rendering & Camera View
 const preview=$('preview');
-function resizeCanvas(){
-  const section=$('viewport-section');
-  if(!section)return;
-  const rect=section.getBoundingClientRect();
-  const dpr=window.devicePixelRatio||1;
-  const w=Math.round(rect.width*dpr);
-  const h=Math.round(rect.height*dpr);
-  if(w>0&&h>0&&(preview.width!==w||preview.height!==h)){
-    preview.width=w;
-    preview.height=h;
-    dirty=true;
-    if(renderer)draw();
-  }
-}
-const resizeObserver=new ResizeObserver(resizeCanvas);
-resizeObserver.observe($('viewport-section'));
 
 function draw(){
   if(!renderer)return;
@@ -529,7 +532,7 @@ function draw(){
   const cam={eye:[center[0]+Math.sin(az)*ring*d,center[1]+Math.sin(elevation)*d,center[2]+Math.cos(az)*ring*d],target:center};
   cam.view=lookAt(cam.eye,center);
   lastCamera=cam;
-  const aspect=(preview.clientWidth||1)/(preview.clientHeight||1);
+  const aspect=(preview.width||1)/(preview.height||1);
   renderer.render({
     t:0,
     world,
@@ -541,11 +544,30 @@ function draw(){
   });
 }
 
+// Debounce resize so dragging dev tools doesn't thrash WebGL buffers
+let resizeTimer=null;
+function onViewportResized(){
+  if(resizeTimer)clearTimeout(resizeTimer);
+  resizeTimer=setTimeout(()=>{
+    if(!currentEntry)return;
+    const res=getTargetResolution();
+    if(Math.abs(preview.width-res.width)>40||Math.abs(preview.height-res.height)>40){
+      select(currentEntry,{variant:currentVariant});
+    }else{
+      dirty=true;
+      draw();
+    }
+  },200);
+}
+const resizeObserver=new ResizeObserver(onViewportResized);
+resizeObserver.observe($('viewport-section'));
+
 function pickPart(clientX,clientY){
   if(!lastCamera||!['prop','model'].includes(currentEntry?.type))return;
   const rect=preview.getBoundingClientRect();
   if(rect.width<=0||rect.height<=0)return;
-  const aspect=rect.width/rect.height;
+  // Aspect ratio matches the projection aspect ratio exactly
+  const aspect=(preview.width||1)/(preview.height||1);
   const x=((clientX-rect.left)/rect.width)*2-1;
   const y=1-((clientY-rect.top)/rect.height)*2;
   const f=Math.tan(25*Math.PI/180);
@@ -553,7 +575,7 @@ function pickPart(clientX,clientY){
   const right=unit(cross(forward,[0,1,0]));
   const up=cross(right,forward);
   const ray=unit(forward.map((v,i)=>v+right[i]*x*f*aspect+up[i]*y*f));
-  let nearest=Infinity,hit;
+  let nearest=Infinity,hit=null;
   for(const mesh of pickMeshes){
     const {points,indices,node}=mesh;
     for(let i=0;i<indices.length;i+=3){
@@ -821,15 +843,14 @@ if(readOnly)for(const id of ['new-color','delete','edit'])$(id).hidden=true;
 
 list();
 
-// Touch & Pointer Gesture Controls (Universal Desktop & Mobile Implementation)
+// Universal Touch & Pointer Gesture Controls (Firefox & Chromium Compatible)
 preview.style.touchAction='none';
 preview.style.cursor='grab';
 
 let pointerDownData=null;
 let isDragging=false;
-const activeTouches=new Map();
-let pinchStartDist=0;
-let pinchStartZoom=1;
+let touchPinchDist=0;
+let touchPinchBaseZoom=1;
 
 preview.addEventListener('pointerdown',e=>{
   // On mobile or anytime canvas is touched, auto-collapse sidebar drawer immediately
@@ -837,31 +858,20 @@ preview.addEventListener('pointerdown',e=>{
 
   if(e.pointerType==='mouse'&&e.button!==0&&e.button!==1)return;
 
-  activeTouches.set(e.pointerId,{x:e.clientX,y:e.clientY});
-
-  if(activeTouches.size===1){
-    pointerDownData={
-      pointerId:e.pointerId,
-      startX:e.clientX,
-      startY:e.clientY,
-      lastX:e.clientX,
-      lastY:e.clientY,
-      time:Date.now(),
-      pointerType:e.pointerType,
-      button:e.button
-    };
-    isDragging=false;
-  }else if(activeTouches.size===2){
-    const [t1,t2]=Array.from(activeTouches.values());
-    pinchStartDist=Math.hypot(t1.x-t2.x,t1.y-t2.y);
-    pinchStartZoom=zoom;
-  }
+  pointerDownData={
+    pointerId:e.pointerId,
+    startX:e.clientX,
+    startY:e.clientY,
+    lastX:e.clientX,
+    lastY:e.clientY,
+    time:Date.now(),
+    pointerType:e.pointerType,
+    button:e.button
+  };
+  isDragging=false;
 });
 
 window.addEventListener('pointermove',e=>{
-  if(activeTouches.has(e.pointerId)){
-    activeTouches.set(e.pointerId,{x:e.clientX,y:e.clientY});
-  }
   if(!pointerDownData||pointerDownData.pointerId!==e.pointerId)return;
 
   const dx=e.clientX-pointerDownData.lastX;
@@ -876,51 +886,66 @@ window.addEventListener('pointermove',e=>{
     collapseSidebar();
   }
 
-  if(activeTouches.size===1&&isDragging){
-    // Two-axis orbit on both desktop left-click and mobile touch drag
+  if(isDragging){
+    // Two-axis orbit on both desktop left-click/middle-click and mobile touch drag
     ({turn,tilt}=applyOrbitDrag(turn,tilt,1,dx,dy));
     dirty=true;
-  }else if(activeTouches.size===2){
-    const [t1,t2]=Array.from(activeTouches.values());
-    const currentDist=Math.hypot(t1.x-t2.x,t1.y-t2.y);
-    if(pinchStartDist>0&&currentDist>0){
-      const ratio=pinchStartDist/currentDist;
-      zoom=Math.max(MIN_ZOOM,Math.min(MAX_ZOOM,pinchStartZoom*ratio));
-      dirty=true;
-    }
   }
 });
 
 window.addEventListener('pointerup',e=>{
-  activeTouches.delete(e.pointerId);
+  if(!pointerDownData)return;
 
-  if(pointerDownData&&pointerDownData.pointerId===e.pointerId){
+  if(pointerDownData.pointerId===e.pointerId){
     const distFromStart=Math.hypot(e.clientX-pointerDownData.startX,e.clientY-pointerDownData.startY);
     const elapsed=Date.now()-pointerDownData.time;
 
-    // Clean tap or click without dragging
-    if(!isDragging&&distFromStart<=DRAG_THRESHOLD&&elapsed<600){
+    // Clean tap or click without dragging (under threshold and reasonable duration)
+    if(!isDragging&&distFromStart<=DRAG_THRESHOLD&&elapsed<700){
       pickPart(pointerDownData.startX,pointerDownData.startY);
     }
 
     pointerDownData=null;
     isDragging=false;
     preview.style.cursor='grab';
-    pinchStartDist=0;
-  }
-
-  if(activeTouches.size===0){
-    preview.style.cursor='grab';
-    pinchStartDist=0;
   }
 });
 
 window.addEventListener('pointercancel',()=>{
-  activeTouches.clear();
   pointerDownData=null;
   isDragging=false;
   preview.style.cursor='grab';
-  pinchStartDist=0;
+});
+
+// Native multi-touch pinch to zoom out, spread to zoom in on mobile
+preview.addEventListener('touchstart',e=>{
+  collapseSidebar();
+  if(e.touches.length===2){
+    const t1=e.touches[0],t2=e.touches[1];
+    touchPinchDist=Math.hypot(t1.clientX-t2.clientX,t1.clientY-t2.clientY);
+    touchPinchBaseZoom=zoom;
+    pointerDownData=null;
+    isDragging=true;
+  }
+},{passive:false});
+
+preview.addEventListener('touchmove',e=>{
+  if(e.touches.length===2&&touchPinchDist>0){
+    e.preventDefault();
+    const t1=e.touches[0],t2=e.touches[1];
+    const currentDist=Math.hypot(t1.clientX-t2.clientX,t1.clientY-t2.clientY);
+    if(currentDist>0){
+      const ratio=touchPinchDist/currentDist;
+      zoom=Math.max(MIN_ZOOM,Math.min(MAX_ZOOM,touchPinchBaseZoom*ratio));
+      dirty=true;
+    }
+  }
+},{passive:false});
+
+preview.addEventListener('touchend',e=>{
+  if(e.touches.length<2){
+    touchPinchDist=0;
+  }
 });
 
 preview.addEventListener('auxclick',e=>{if(e.button===1)e.preventDefault();});
@@ -936,7 +961,7 @@ preview.addEventListener('wheel',e=>{
 
 let previous=0,lastDraw=0;
 function animate(t){
-  const spinning=turntableOn&&activeTouches.size===0&&!document.hidden;
+  const spinning=turntableOn&&!isDragging&&!document.hidden;
   if(spinning&&renderer){
     turn+=(previous?Math.min(t-previous,100):0)*.025;
     dirty=true;

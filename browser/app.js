@@ -53,11 +53,13 @@ function preloadNearby(selectedEntry){
 function swatch(material,color){
   color={...color,parameters:resolveColor(library.catalog,color.id)};
   const vertices=[],indices=[],nu=64,nv=33;
-  for(let i=0;i<nu;i++)for(let j=0;j<nv;j++){
-    const a=i/nu*Math.PI*2,b=j/(nv-1)*Math.PI,x=Math.sin(b)*Math.cos(a),y=Math.cos(b),z=Math.sin(b)*Math.sin(a);
+  // Use nu + 1 columns so the last column carries U = 1.0 at identical XYZ positions to U = 0.0,
+  // preventing derivative explosion across the seam quad.
+  for(let i=0;i<=nu;i++)for(let j=0;j<nv;j++){
+    const a=(i/nu)*Math.PI*2,b=j/(nv-1)*Math.PI,x=Math.sin(b)*Math.cos(a),y=Math.cos(b),z=Math.sin(b)*Math.sin(a);
     vertices.push(x,y,z,x,y,z,i/nu,j/(nv-1));
   }
-  for(let i=0;i<nu;i++)for(let j=0;j<nv-1;j++){const a=i*nv+j,b=((i+1)%nu)*nv+j;indices.push(a,b,b+1,a,b+1,a+1);}
+  for(let i=0;i<nu;i++)for(let j=0;j<nv-1;j++){const a=i*nv+j,b=(i+1)*nv+j;indices.push(a,b,b+1,a,b+1,a+1);}
   const vv=new Float32Array(vertices),ii=new Uint32Array(indices),bytes=new Uint8Array(vv.byteLength+ii.byteLength);bytes.set(new Uint8Array(vv.buffer));bytes.set(new Uint8Array(ii.buffer),vv.byteLength);
   return {raw:bytes.buffer,asset:{bounds:[[-1,-1,-1],[1,1,1]]},nodes:[{vertex_offset:0,index_offset:vv.byteLength,vertex_count:vertices.length/8,index_count:indices.length,
     ...material.parameters,color:color.parameters.primary,colorData:color.parameters,kind:material.profile,pos:[0,0,0],rot:[0,0,0],scale:[1,1,1],assembly:0,deformability:0,label:'material swatch',surface_center:[0,0,0],surface_normal:[0,0,1]}]};

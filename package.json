@@ -11,7 +11,7 @@
     "build:pages": "vite build && node tools/copy-pages-assets.mjs"
   },
   "dependencies": {
-    "trinity": "https://github.com/realrandolph/trinity/archive/refs/tags/v1.2.2.tar.gz"
+    "trinity": "https://github.com/realrandolph/trinity/archive/refs/tags/v1.2.3.tar.gz"
   },
   "devDependencies": {
     "playwright": "1.63.0",

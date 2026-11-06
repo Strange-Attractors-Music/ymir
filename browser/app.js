@@ -16,11 +16,13 @@ let turntableOn=false;
 const stagedChanges=new Map(); // slotId -> { materialId, colorId }
 let pendingSwitchAction=null;
 
-const library=await loadLibrary(new URL('../',import.meta.url)).catch(e=>{$('error').textContent=e.message;throw e;});
+const TRINITY_VERSION = '1.2.3';
+const library=await loadLibrary(new URL('../',import.meta.url),{suiteManifest:`materials/ymir-surfaces-v1/suite.json?v=${TRINITY_VERSION}`}).catch(e=>{$('error').textContent=e.message;throw e;});
 const libraries=new Map();
 
 async function libraryFor(entry){
-  const suiteManifest=entry.suiteManifest??'materials/ymir-surfaces-v1/suite.json';
+  const baseSuite=entry.suiteManifest??'materials/ymir-surfaces-v1/suite.json';
+  const suiteManifest=`${baseSuite}?v=${TRINITY_VERSION}`;
   if(!libraries.has(suiteManifest))libraries.set(suiteManifest,loadLibrary(new URL('../',import.meta.url),{suiteManifest}));
   return libraries.get(suiteManifest);
 }

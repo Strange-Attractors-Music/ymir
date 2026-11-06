@@ -46,7 +46,7 @@ test('browser server serves only public Ymir/Trinity files',async()=>{
   const server=createAssetServer();await new Promise(r=>server.listen(0,'127.0.0.1',r));
   try{const base=`http://127.0.0.1:${server.address().port}`;
     assert.equal((await fetch(base+'/ymir/browser/')).status,200);
-    assert.equal((await fetch(base+'/trinity/dist/trinity-1.2.2.mjs')).status,200);
+    assert.equal((await fetch(base+'/trinity/dist/trinity-1.2.3.mjs')).status,200);
     for(const path of ['/ymir/.git/config','/ymir/%2e%2e%2fAGENTS.md','/unknown/'])assert.equal((await fetch(base+path)).status,404);
   }finally{await new Promise(r=>server.close(r));}
 });

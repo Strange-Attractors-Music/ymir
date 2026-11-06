@@ -6,6 +6,7 @@ const readOnly=typeof __YMIR_READ_ONLY__!=='undefined'&&__YMIR_READ_ONLY__;
 
 const MIN_ZOOM = 0.55; // Prevent camera from entering inside model geometry
 const MAX_ZOOM = 3.5;
+const DRAG_THRESHOLD = 8; // Pixel distance to distinguish tap/click from drag/orbit
 
 let renderer,world,transforms,previewTransition=null;
 let turn=0,tilt=0,zoom=1,generation=0,dirty=false;
@@ -22,6 +23,31 @@ async function libraryFor(entry){
   const suiteManifest=entry.suiteManifest??'materials/ymir-surfaces-v1/suite.json';
   if(!libraries.has(suiteManifest))libraries.set(suiteManifest,loadLibrary(new URL('../',import.meta.url),{suiteManifest}));
   return libraries.get(suiteManifest);
+}
+
+// Preload models surrounding the active entry for instant zero-lag switching
+function preloadNearby(selectedEntry){
+  if(!selectedEntry||!library?.catalog?.assets)return;
+  const allEntries=library.catalog.assets.filter(a=>['prop','model'].includes(a.type));
+  const idx=allEntries.findIndex(a=>a.id===selectedEntry.id||(selectedEntry.modelId&&a.id===selectedEntry.modelId));
+  if(idx===-1)return;
+  const start=Math.max(0,idx-5);
+  const end=Math.min(allEntries.length,idx+6);
+  const targets=allEntries.slice(start,end).filter(a=>a.id!==selectedEntry.id);
+
+  const schedulePreload=window.requestIdleCallback||(cb=>setTimeout(cb,80));
+  schedulePreload(async()=>{
+    for(const item of targets){
+      try{
+        const lib=await libraryFor(item);
+        if(item.type==='prop'){
+          lib.loadProp(item.manifest).catch(()=>{});
+        }else if(item.type==='model'){
+          lib.loadModel(item.manifest).catch(()=>{});
+        }
+      }catch(_){}
+    }
+  });
 }
 
 function swatch(material,color){
@@ -46,6 +72,10 @@ async function select(entry,{variant=entry.defaultVariant,previewMaterial,previe
   updateSaveCheckVisibility();
   if($('part-card'))$('part-card').hidden=true;
   selectedSlot=null;selectedPart=null;
+
+  // Show loading spinner while loading model resources
+  const spinner=$('loading-spinner');
+  if(spinner)spinner.hidden=false;
 
   const variants=$('variant');
   if(variants){
@@ -111,7 +141,7 @@ async function select(entry,{variant=entry.defaultVariant,previewMaterial,previe
       return {node:n,points,indices:new Uint32Array(prop.raw,n.index_offset,n.index_count)};
     }):[];
 
-    // Provide immediate base surface model structure so part picking works instantly
+    // Synchronously initialize base surface state from loaded asset so part picking works immediately
     surfaceState={
       modelData:prop.asset,
       slots:prop.asset?.slots??[],
@@ -122,14 +152,17 @@ async function select(entry,{variant=entry.defaultVariant,previewMaterial,previe
       configureSurface(prop.asset);
     }
 
-    // DRAW IMMEDIATELY ON SELECTION - Zero lag, no waiting for async calls
+    // DRAW IMMEDIATELY ON SELECTION - Zero lag, instant visual update
     dirty=true;
     draw();
+    if(spinner)spinner.hidden=true;
+
     requestAnimationFrame(()=>{
       dirty=true;
       draw();
     });
 
+    // Swatch controls
     const swatchControls=$('swatch-controls');
     if(swatchControls){
       swatchControls.hidden=!['material','color'].includes(entry.type);
@@ -142,9 +175,13 @@ async function select(entry,{variant=entry.defaultVariant,previewMaterial,previe
       }
     }
 
+    // Update list button active styles
     for(const button of $('list').children){
       button.setAttribute('aria-pressed',button.dataset.id===entry.id||$('type').value==='prop'&&button.dataset.id===entry.modelId?'true':'false');
     }
+
+    // Trigger background preloading of surrounding models for instant future switches
+    preloadNearby(entry);
 
     // Fetch full server-side metadata in background without blocking rendering or part selection
     if(!readOnly&&['prop','model'].includes(entry.type)){
@@ -154,11 +191,10 @@ async function select(entry,{variant=entry.defaultVariant,previewMaterial,previe
           surfaceState=state;
           configureSurface(entry.type==='model'?prop.asset:(state.model||prop.asset));
         }
-      }catch(err){
-        // Non-fatal: local rendering remains functional
-      }
+      }catch(_){}
     }
   }catch(e){
+    if(spinner)spinner.hidden=true;
     if(token===generation)$('error').textContent=e.stack??e.message;
   }
 }
@@ -170,6 +206,7 @@ function fillResources(select,type,id){
 
 function fillColorResources(select,material,id){
   fillResources(select,'color',id);
+  if(!material)return;
   const color=library.catalog.assets.find(a=>a.id===material.defaultColorId);
   if(color)select.prepend(new Option(`Material default — ${color.name}`,''));
   select.value=id??'';
@@ -211,6 +248,7 @@ function highlightSelected(){
     n.highlight=Boolean(selectedSlot&&ids.includes(n.surfaceSlot));
   }
   dirty=true;
+  draw();
 }
 
 function onPartSelected(slotId,partId){
@@ -220,8 +258,8 @@ function onPartSelected(slotId,partId){
   highlightSelected();
 
   const modelData=surfaceState?.modelData||currentEntry;
-  const slot=modelData?.slots?.find(s=>s.id===slotId);
-  const part=modelData?.parts?.find(p=>p.id===partId);
+  const slot=modelData?.slots?.find(s=>(s.id===slotId||s.slotId===slotId));
+  const part=modelData?.parts?.find(p=>(p.id===partId||p.partId===partId));
   const group=selectedGroup();
 
   const title=slot?slot.name:(part?.name||'Selected Part');
@@ -277,6 +315,7 @@ function updateLiveNodes(){
   }
   world={...world};
   dirty=true;
+  draw();
 }
 
 function updateSaveCheckVisibility(){
@@ -493,13 +532,13 @@ function draw(){
   });
 }
 
-function pickPart(e){
+function pickPart(clientX,clientY){
   if(!lastCamera||!['prop','model'].includes(currentEntry?.type))return;
   const rect=preview.getBoundingClientRect();
   if(rect.width<=0||rect.height<=0)return;
   const aspect=rect.width/rect.height;
-  const x=((e.clientX-rect.left)/rect.width)*2-1;
-  const y=1-((e.clientY-rect.top)/rect.height)*2;
+  const x=((clientX-rect.left)/rect.width)*2-1;
+  const y=1-((clientY-rect.top)/rect.height)*2;
   const f=Math.tan(25*Math.PI/180);
   const forward=unit(sub(lastCamera.target,lastCamera.eye));
   const right=unit(cross(forward,[0,1,0]));
@@ -530,7 +569,7 @@ const toggleSidebarBtn=$('toggle-sidebar');
 const drawerBackdrop=$('drawer-backdrop');
 
 function collapseSidebar(){
-  if(sidebarDrawer){
+  if(sidebarDrawer&&!sidebarDrawer.classList.contains('drawer-closed')){
     sidebarDrawer.classList.add('drawer-closed');
   }
   if(drawerBackdrop){
@@ -560,6 +599,15 @@ if(drawerBackdrop){
   drawerBackdrop.onclick=collapseSidebar;
 }
 
+// Window-level dismiss: tap or drag outside drawer collapses mobile sidebar immediately
+window.addEventListener('pointerdown',e=>{
+  if(window.innerWidth<=768&&sidebarDrawer&&!sidebarDrawer.classList.contains('drawer-closed')){
+    if(!e.target.closest('#sidebar-drawer')&&!e.target.closest('#toggle-sidebar')){
+      collapseSidebar();
+    }
+  }
+},{passive:true});
+
 // On mobile, automatically collapse on initial load
 if(window.innerWidth<=768){
   collapseSidebar();
@@ -582,13 +630,10 @@ function list(){
     b.append(small);
     b.onclick=()=>{
       const targetEntry=type==='prop'?(members(entry).find(matches)??members(entry)[0]):entry;
-      if(targetEntry.id===currentEntry?.id){
-        collapseSidebar();
-        return;
-      }
+      collapseSidebar();
+      if(targetEntry.id===currentEntry?.id)return;
       requestSwitch(()=>{
         select(targetEntry);
-        collapseSidebar();
       });
     };
     $('list').append(b);
@@ -787,7 +832,8 @@ preview.onpointerdown=e=>{
     y:e.clientY,
     pointerType:e.pointerType,
     button:e.button,
-    moved:false
+    downTime:Date.now(),
+    isDragging:false
   });
   if(activePointers.size===1){
     preview.style.cursor='grabbing';
@@ -798,13 +844,6 @@ preview.onpointerdown=e=>{
   }
 };
 
-// Also collapse sidebar if user taps anywhere in the viewport area
-$('viewport-section').addEventListener('pointerdown',e=>{
-  if(!e.target.closest('#sidebar-drawer')&&!e.target.closest('#toggle-sidebar')){
-    collapseSidebar();
-  }
-});
-
 preview.onpointermove=e=>{
   if(!activePointers.has(e.pointerId))return;
   const p=activePointers.get(e.pointerId);
@@ -812,17 +851,20 @@ preview.onpointermove=e=>{
   const dy=e.clientY-p.y;
   p.x=e.clientX;
   p.y=e.clientY;
-  if(Math.hypot(e.clientX-p.startX,e.clientY-p.startY)>6){
-    p.moved=true;
+
+  // Once finger/mouse moves beyond DRAG_THRESHOLD, switch to drag/orbit mode
+  if(!p.isDragging&&Math.hypot(e.clientX-p.startX,e.clientY-p.startY)>DRAG_THRESHOLD){
+    p.isDragging=true;
+    collapseSidebar(); // Also collapse on tap+drag motion
   }
 
-  if(activePointers.size===1){
+  if(activePointers.size===1&&p.isDragging){
     // Both desktop left-click/middle-click drag AND mobile touch drag perform two-axis orbit:
     // down=CCW on X, up=CW on X; right=CCW on Y, left=CW on Y
     ({turn,tilt}=applyOrbitDrag(turn,tilt,1,dx,dy));
     dirty=true;
   }else if(activePointers.size===2){
-    // Two-finger pinch to zoom out, spread to zoom in
+    // Two-finger gesture: pinch to zoom out, spread to zoom in
     const [p1,p2]=Array.from(activePointers.values());
     const currentDist=Math.hypot(p1.x-p2.x,p1.y-p2.y);
     if(pinchStartDist>0&&currentDist>0){
@@ -839,7 +881,9 @@ function endPointer(e){
   if(!activePointers.has(e.pointerId))return;
   const p=activePointers.get(e.pointerId);
   const wasSingle=activePointers.size===1;
-  const isClick=wasSingle&&!p.moved&&Math.hypot(e.clientX-p.startX,e.clientY-p.startY)<6;
+  const elapsed=Date.now()-p.downTime;
+  const dist=Math.hypot(e.clientX-p.startX,e.clientY-p.startY);
+  const isClick=wasSingle&&!p.isDragging&&dist<=DRAG_THRESHOLD&&elapsed<500;
 
   activePointers.delete(e.pointerId);
   if(preview.hasPointerCapture(e.pointerId)){
@@ -853,11 +897,11 @@ function endPointer(e){
     const remaining=activePointers.values().next().value;
     remaining.x=remaining.startX=e.clientX;
     remaining.y=remaining.startY=e.clientY;
-    remaining.moved=true;
+    remaining.isDragging=true;
   }
 
-  if(isClick&&(p.pointerType==='touch'||p.button===0)){
-    pickPart(e);
+  if(isClick&&(p.pointerType==='touch'||p.pointerType==='pen'||p.button===0)){
+    pickPart(p.startX,p.startY);
   }
 }
 

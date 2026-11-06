@@ -109,7 +109,7 @@ aside input:focus, aside select:focus {
   background: rgba(0, 0, 0, 0.55);
   backdrop-filter: blur(2px);
   -webkit-backdrop-filter: blur(2px);
-  z-index: 25;
+  z-index: 28;
 }
 
 /* Viewport Section: Full-bleed 3D canvas and overlaid HUD controls */
@@ -133,6 +133,41 @@ aside input:focus, aside select:focus {
   display: block;
   touch-action: none;
   cursor: grab;
+}
+
+/* Centered Loading Spinner */
+.canvas-spinner {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  background: rgba(18, 22, 32, 0.88);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  padding: 16px 24px;
+  border-radius: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6);
+  color: #f0f6fc;
+  font-size: 13px;
+  font-weight: 500;
+  pointer-events: none;
+  z-index: 35;
+}
+.spinner-ring {
+  width: 32px;
+  height: 32px;
+  border: 3px solid rgba(56, 189, 248, 0.2);
+  border-top-color: #38bdf8;
+  border-radius: 50%;
+  animation: ymir-spin 0.75s linear infinite;
+}
+@keyframes ymir-spin {
+  to { transform: rotate(360deg); }
 }
 
 /* Floating top bar */
@@ -539,6 +574,7 @@ dialog input:focus, dialog textarea:focus, dialog select:focus {
 /* Responsive adjustments for Mobile/Tablet */
 @media (max-width: 768px) {
   header { padding: 8px 12px; gap: 8px; }
+  header h1 { font-size: 16px; }
   header p { display: none; }
   .mobile-nav-toggle { display: flex; }
 
@@ -555,7 +591,7 @@ dialog input:focus, dialog textarea:focus, dialog select:focus {
     left: 0;
     width: 280px;
     max-width: 85vw;
-    box-shadow: 8px 0 32px rgba(0, 0, 0, 0.8);
+    box-shadow: 8px 0 32px rgba(0, 0, 0, 0.85);
     transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1);
     transform: translateX(0);
     z-index: 30;
@@ -622,6 +658,12 @@ dialog input:focus, dialog textarea:focus, dialog select:focus {
   <section id="viewport-section">
     <!-- Full-bleed 3D WebGL Canvas -->
     <canvas id="preview" aria-label="3D asset preview; drag left or right to rotate; middle-drag or touch drag to orbit; pinch to zoom; tap to select"></canvas>
+
+    <!-- Centered Loading Spinner -->
+    <div id="loading-spinner" class="canvas-spinner" hidden>
+      <div class="spinner-ring"></div>
+      <span id="spinner-text">Loading model…</span>
+    </div>
 
     <!-- Top Floating HUD: Asset Title & Variant Selector & Actions -->
     <div id="canvas-top-bar" class="hud-top">

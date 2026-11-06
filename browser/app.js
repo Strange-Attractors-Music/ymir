@@ -4,6 +4,9 @@ import {BASE_ELEVATION,applyOrbitDrag} from './orbit-controls.js';
 const $=id=>document.getElementById(id);
 const readOnly=typeof __YMIR_READ_ONLY__!=='undefined'&&__YMIR_READ_ONLY__;
 
+const MIN_ZOOM = 0.55; // Prevent camera from entering inside model geometry
+const MAX_ZOOM = 3.5;
+
 let renderer,world,transforms,previewTransition=null;
 let turn=0,tilt=0,zoom=1,generation=0,dirty=false,drag=null;
 let currentEntry,currentVariant,editState,editTargetState,deleteState;
@@ -77,7 +80,18 @@ async function select(entry,{variant=entry.defaultVariant,previewMaterial,previe
     world={index:0,start_s:0,end_s:1,background:[.58,.40,.34],accent:[.55,.12,.18],nodes:isMaterialSwatch?[]:previewNodes,rigs:[{pos:[0,0,0]}]};
     if(entry.preview==='backdrop')world.nodes=[];
     const transition={meshData:prop.raw,vertex_offset:0,...prop.nodes[0]};
-    const candidate=await createRenderer({canvas:$('preview'),book:{worlds:[{...world,meshData:prop.raw}],transition},shaders:selectedLibrary.shaders,quality:{shadowSize:2048,cacheEnvironment:true,synchronize:false}});
+
+    // Ensure canvas size is accurate prior to creating WebGL framebuffers and viewport
+    resizeCanvas();
+
+    const candidate=await createRenderer({
+      canvas:$('preview'),
+      width:preview.width,
+      height:preview.height,
+      book:{worlds:[{...world,meshData:prop.raw}],transition},
+      shaders:selectedLibrary.shaders,
+      quality:{shadowSize:2048,cacheEnvironment:true,synchronize:false}
+    });
     if(token!==generation){candidate.dispose();return;}
     renderer=candidate;
     world.bounds=prop.asset.bounds;
@@ -115,8 +129,14 @@ async function select(entry,{variant=entry.defaultVariant,previewMaterial,previe
     for(const button of $('list').children){
       button.setAttribute('aria-pressed',button.dataset.id===entry.id||$('type').value==='prop'&&button.dataset.id===entry.modelId?'true':'false');
     }
-    resizeCanvas();
+
+    // Immediately draw and schedule the frame to ensure instant render without needing rotation
+    dirty=true;
     draw();
+    requestAnimationFrame(()=>{
+      dirty=true;
+      draw();
+    });
   }catch(e){
     if(token===generation)$('error').textContent=e.stack??e.message;
   }
@@ -420,10 +440,11 @@ function resizeCanvas(){
   const dpr=window.devicePixelRatio||1;
   const w=Math.round(rect.width*dpr);
   const h=Math.round(rect.height*dpr);
-  if(preview.width!==w||preview.height!==h){
+  if(w>0&&h>0&&(preview.width!==w||preview.height!==h)){
     preview.width=w;
     preview.height=h;
     dirty=true;
+    if(renderer)draw();
   }
 }
 const resizeObserver=new ResizeObserver(resizeCanvas);
@@ -480,6 +501,15 @@ function pickPart(e){
   }
 }
 
+// Mobile sidebar drawer handling
+const sidebarDrawer=$('sidebar-drawer');
+const toggleSidebarBtn=$('toggle-sidebar');
+if(toggleSidebarBtn&&sidebarDrawer){
+  toggleSidebarBtn.onclick=()=>{
+    sidebarDrawer.classList.toggle('drawer-closed');
+  };
+}
+
 function list(){
   const q=$('search').value.toLowerCase(),type=$('type').value;
   const matches=a=>`${a.name} ${a.id} ${a.description??''} ${(a.tags??[]).join(' ')} ${(a.variants??[]).map(v=>`${v.name} ${v.description??''} ${(v.tags??[]).join(' ')}`).join(' ')}`.toLowerCase().includes(q);
@@ -498,7 +528,13 @@ function list(){
     b.onclick=()=>{
       const targetEntry=type==='prop'?(members(entry).find(matches)??members(entry)[0]):entry;
       if(targetEntry.id===currentEntry?.id)return;
-      requestSwitch(()=>select(targetEntry));
+      requestSwitch(()=>{
+        select(targetEntry);
+        // On mobile, auto-close the drawer after selection so the user sees the model
+        if(window.innerWidth<=768&&sidebarDrawer){
+          sidebarDrawer.classList.add('drawer-closed');
+        }
+      });
     };
     $('list').append(b);
   }
@@ -674,46 +710,115 @@ if(readOnly)for(const id of ['new-color','delete','edit'])$(id).hidden=true;
 
 list();
 
+// Touch & Pointer Gesture Controls (Supports Desktop Mouse & Full-Featured Mobile Touch)
 preview.style.touchAction='none';
 preview.style.cursor='grab';
+
+const activePointers=new Map();
+let pinchStartDist=0;
+let pinchStartZoom=1;
+
 preview.onpointerdown=e=>{
-  if(e.button!==0&&e.button!==1)return;
+  if(e.pointerType==='mouse'&&e.button!==0&&e.button!==1)return;
   e.preventDefault();
-  drag={id:e.pointerId,button:e.button,x:e.clientX,y:e.clientY,startX:e.clientX,startY:e.clientY};
   preview.setPointerCapture(e.pointerId);
-  preview.style.cursor='grabbing';
+  activePointers.set(e.pointerId,{
+    startX:e.clientX,
+    startY:e.clientY,
+    x:e.clientX,
+    y:e.clientY,
+    pointerType:e.pointerType,
+    button:e.button,
+    moved:false
+  });
+  if(activePointers.size===1){
+    preview.style.cursor='grabbing';
+  }else if(activePointers.size===2){
+    const [p1,p2]=Array.from(activePointers.values());
+    pinchStartDist=Math.hypot(p1.x-p2.x,p1.y-p2.y);
+    pinchStartZoom=zoom;
+  }
 };
+
 preview.onpointermove=e=>{
-  if(!drag||drag.id!==e.pointerId)return;
-  drag.moved||=Math.hypot(e.clientX-drag.startX,e.clientY-drag.startY)>5;
-  ({turn,tilt}=applyOrbitDrag(turn,tilt,drag.button,e.clientX-drag.x,e.clientY-drag.y));
-  drag.x=e.clientX;
-  drag.y=e.clientY;
-  dirty=true;
+  if(!activePointers.has(e.pointerId))return;
+  const p=activePointers.get(e.pointerId);
+  const dx=e.clientX-p.x;
+  const dy=e.clientY-p.y;
+  p.x=e.clientX;
+  p.y=e.clientY;
+  if(Math.hypot(e.clientX-p.startX,e.clientY-p.startY)>8){
+    p.moved=true;
+  }
+
+  if(activePointers.size===1){
+    // Single-finger touch or mouse drag:
+    // On touch: always use two-axis orbit (whichever direction chosen: down=CCW on X, up=CW on X, right=CCW on Y, left=CW on Y)
+    // On mouse: left-button (0) is horizontal only; middle-button (1) is two-axis.
+    const isTouch=p.pointerType==='touch'||p.pointerType==='pen';
+    const useTwoAxis=isTouch||p.button===1;
+    ({turn,tilt}=applyOrbitDrag(turn,tilt,useTwoAxis?1:0,dx,dy));
+    dirty=true;
+  }else if(activePointers.size===2){
+    // Two-finger gesture: pinch to zoom out, spread to zoom in
+    const [p1,p2]=Array.from(activePointers.values());
+    const currentDist=Math.hypot(p1.x-p2.x,p1.y-p2.y);
+    if(pinchStartDist>0&&currentDist>0){
+      // Spreading fingers apart (currentDist > pinchStartDist): ratio < 1 -> zoom distance decreases -> ZOOMS IN!
+      // Pinching fingers together (currentDist < pinchStartDist): ratio > 1 -> zoom distance increases -> ZOOMS OUT!
+      const ratio=pinchStartDist/currentDist;
+      zoom=Math.max(MIN_ZOOM,Math.min(MAX_ZOOM,pinchStartZoom*ratio));
+      dirty=true;
+    }
+  }
 };
-function endDrag(e){
-  if(drag?.id!==e.pointerId)return;
-  const click=drag.button===0&&e.type==='pointerup'&&!drag.moved&&Math.hypot(e.clientX-drag.startX,e.clientY-drag.startY)<5;
-  drag=null;
-  preview.style.cursor='grab';
-  if(preview.hasPointerCapture(e.pointerId))preview.releasePointerCapture(e.pointerId);
-  if(click)pickPart(e);
+
+function endPointer(e){
+  if(!activePointers.has(e.pointerId))return;
+  const p=activePointers.get(e.pointerId);
+  const wasSingle=activePointers.size===1;
+  const isClick=wasSingle&&!p.moved&&Math.hypot(e.clientX-p.startX,e.clientY-p.startY)<8;
+
+  activePointers.delete(e.pointerId);
+  if(preview.hasPointerCapture(e.pointerId)){
+    preview.releasePointerCapture(e.pointerId);
+  }
+
+  if(activePointers.size===0){
+    preview.style.cursor='grab';
+    pinchStartDist=0;
+  }else if(activePointers.size===1){
+    const remaining=activePointers.values().next().value;
+    remaining.x=remaining.startX=e.clientX;
+    remaining.y=remaining.startY=e.clientY;
+    remaining.moved=true;
+  }
+
+  if(isClick&&(p.pointerType==='touch'||p.button===0)){
+    pickPart(e);
+  }
 }
-preview.onpointerup=endDrag;
-preview.onpointercancel=endDrag;
-preview.onlostpointercapture=()=>{drag=null;preview.style.cursor='grab';};
+
+preview.onpointerup=endPointer;
+preview.onpointercancel=endPointer;
+preview.onlostpointercapture=()=>{
+  activePointers.clear();
+  preview.style.cursor='grab';
+  pinchStartDist=0;
+};
 preview.addEventListener('auxclick',e=>{if(e.button===1)e.preventDefault();});
 preview.addEventListener('wheel',e=>{
   if(!renderer)return;
   e.preventDefault();
   const pixels=e.deltaY*(e.deltaMode===1?16:e.deltaMode===2?preview.clientHeight:1);
-  zoom=Math.max(.35,Math.min(4,zoom*Math.exp(Math.max(-1000,Math.min(1000,pixels))*.0015)));
+  const factor=Math.exp(Math.max(-1000,Math.min(1000,pixels))*.0015);
+  zoom=Math.max(MIN_ZOOM,Math.min(MAX_ZOOM,zoom*factor));
   dirty=true;
 },{passive:false});
 
 let previous=0,lastDraw=0;
 function animate(t){
-  const spinning=turntableOn&&!drag&&!document.hidden;
+  const spinning=turntableOn&&activePointers.size===0&&!document.hidden;
   if(spinning&&renderer){
     turn+=(previous?Math.min(t-previous,100):0)*.025;
     dirty=true;
@@ -726,8 +831,8 @@ function animate(t){
       lastDraw=t;
     }catch(e){
       turntableOn=false;
-      $('turntable-btn').setAttribute('aria-pressed','false');
-      $('turntable-btn').classList.remove('active');
+      $('turntable-btn')?.setAttribute('aria-pressed','false');
+      $('turntable-btn')?.classList.remove('active');
       dirty=false;
       $('error').textContent=e.message;
     }

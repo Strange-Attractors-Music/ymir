@@ -17,9 +17,9 @@ export function createLightingResources(gl){
     gl.texParameteri(gl.TEXTURE_CUBE_MAP,gl.TEXTURE_MIN_FILTER,size===1?gl.LINEAR:gl.LINEAR_MIPMAP_LINEAR);gl.texParameteri(gl.TEXTURE_CUBE_MAP,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
     if(size>1)gl.generateMipmap(gl.TEXTURE_CUBE_MAP);return texture;
   };
-  const spotA=depthTarget(3072),spotB=depthTarget(3072),environment=cube(1024),fallback=cube(1);
-  const framebuffer=gl.createFramebuffer(),depth=gl.createRenderbuffer();gl.bindFramebuffer(gl.FRAMEBUFFER,framebuffer);gl.bindRenderbuffer(gl.RENDERBUFFER,depth);gl.renderbufferStorage(gl.RENDERBUFFER,gl.DEPTH_COMPONENT24,1024,1024);gl.framebufferRenderbuffer(gl.FRAMEBUFFER,gl.DEPTH_ATTACHMENT,gl.RENDERBUFFER,depth);gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_CUBE_MAP_POSITIVE_X,environment,0);
+  const spotA=depthTarget(1536),spotB=depthTarget(1536),environment=cube(512),fallback=cube(1);
+  const framebuffer=gl.createFramebuffer(),depth=gl.createRenderbuffer();gl.bindFramebuffer(gl.FRAMEBUFFER,framebuffer);gl.bindRenderbuffer(gl.RENDERBUFFER,depth);gl.renderbufferStorage(gl.RENDERBUFFER,gl.DEPTH_COMPONENT24,512,512);gl.framebufferRenderbuffer(gl.FRAMEBUFFER,gl.DEPTH_ATTACHMENT,gl.RENDERBUFFER,depth);gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_CUBE_MAP_POSITIVE_X,environment,0);
   if(gl.checkFramebufferStatus(gl.FRAMEBUFFER)!==gl.FRAMEBUFFER_COMPLETE)throw new Error('Environment probe target incomplete');
   gl.bindFramebuffer(gl.FRAMEBUFFER,null);
-  return {spotA,spotB,environment,fallback,framebuffer,size:1024,ready:false,dispose(){for(const t of [spotA,spotB]){gl.deleteTexture(t.texture);gl.deleteFramebuffer(t.framebuffer);}gl.deleteTexture(environment);gl.deleteTexture(fallback);gl.deleteFramebuffer(framebuffer);gl.deleteRenderbuffer(depth);}};
+  return {spotA,spotB,environment,fallback,framebuffer,size:512,ready:false,dispose(){for(const t of [spotA,spotB]){gl.deleteTexture(t.texture);gl.deleteFramebuffer(t.framebuffer);}gl.deleteTexture(environment);gl.deleteTexture(fallback);gl.deleteFramebuffer(framebuffer);gl.deleteRenderbuffer(depth);}};
 }

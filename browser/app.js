@@ -967,7 +967,7 @@ function animate(t){
     dirty=true;
   }
   previous=t;
-  if(dirty&&renderer&&!document.hidden&&t-lastDraw>=1000/24){
+  if(dirty&&renderer&&!document.hidden&&t-lastDraw>=1000/60){
     try{
       draw();
       dirty=false;

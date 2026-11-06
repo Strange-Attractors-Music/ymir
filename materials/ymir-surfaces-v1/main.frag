@@ -126,7 +126,13 @@ vec3 sceneEnvironment(vec3 direction,float rough){
     vec3 distances=(wall-world_pos)/safeRay;float distance=max(.0,min(distances.x,min(distances.y,distances.z)));
     vec3 projected=normalize(world_pos+direction*distance-environment_position);
     vec3 encoded=textureLod(environment_map,projected,clamp(rough,0.0,1.0)*10.0).rgb;
-    return min(encoded*.85/max(vec3(.025),vec3(1)-encoded),vec3(12.0));
+    vec3 probeColor=min(encoded*.85/max(vec3(.025),vec3(1)-encoded),vec3(12.0));
+    // Prevent self-reflection artifacts on downward-facing surfaces where the probe (positioned
+    // above the stage at Y=0.55 looking down) captured the top of the object. Downward reflections
+    // smoothly transition to the analytic studio floor lighting instead of mirroring the top.
+    float floorFactor=smoothstep(0.05,-0.15,direction.y);
+    vec3 floorColor=roughRoom(direction,rough)*1.2;
+    return mix(probeColor,floorColor,floorFactor);
 }
 float coneLight(vec3 p,vec3 start,vec3 target,float width){
     vec3 axis=target-start;float t=clamp(dot(p-start,axis)/dot(axis,axis),0.0,1.0);
